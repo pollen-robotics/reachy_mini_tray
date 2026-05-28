@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 /// Cap matches the agreed product limit (TRAY_ONLY_FEASIBILITY §4 - logs).
-pub const MAX_LOG_LINES: usize = 2000;
+pub const MAX_LOG_LINES: usize = 500;
 
 /// Event name listened to by the logs window.
 pub const EVENT_LOG_APPEND: &str = "log:append";

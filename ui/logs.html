@@ -48,36 +48,141 @@
 
       #root {
         display: flex;
-        flex-direction: column;
         height: 100vh;
+        min-height: 0;
       }
 
-      header {
+      /* Generic per-pane header (used by both panes). */
+      .pane-header {
         display: flex;
         align-items: center;
         gap: 8px;
-        padding: 8px 12px;
+        padding: 6px 10px;
         background: var(--bg-elev);
         border-bottom: 1px solid var(--border);
         user-select: none;
         -webkit-app-region: drag;
+        min-height: 36px;
       }
 
-      header > * { -webkit-app-region: no-drag; }
+      .pane-header > * { -webkit-app-region: no-drag; }
+      .pane-header .spacer { flex: 1; }
 
-      .title {
-        font-weight: 600;
-        font-size: 12px;
+      /* Subtle vertical separator between header groups. */
+      .pane-header .sep {
+        width: 1px;
+        align-self: stretch;
+        background: var(--border);
+        margin: 4px 4px;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 10.5px;
         color: var(--muted);
         letter-spacing: 0.02em;
-        margin-right: 8px;
-        text-transform: uppercase;
+        text-transform: lowercase;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+
+      .status-pill::before {
+        content: "";
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: currentColor;
+        flex-shrink: 0;
+      }
+
+      /* Pulsing dot for live state. */
+      .status-pill.s-live::before {
+        animation: pulse 1.6s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: 0.35; }
+      }
+
+      .status-pill.s-live { color: #34c759; }
+      .status-pill.s-loading,
+      .status-pill.s-connecting { color: var(--info); }
+      .status-pill.s-offline { color: var(--warn); }
+      .status-pill.s-error { color: var(--error); }
+
+      .status-pill .meta {
+        color: var(--muted);
+        opacity: 0.8;
+      }
+
+      /* Viewer pane: 3D viewer (left), default 30%. */
+      .viewer-pane {
+        flex: 0 0 30%;
+        min-width: 240px;
+        background: var(--bg);
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+
+      .viewer-pane.hidden { display: none; }
+
+      .viewer-mount {
+        flex: 1;
+        position: relative;
+        min-height: 0;
+      }
+
+      .viewer-mount canvas {
+        display: block;
+        width: 100% !important;
+        height: 100% !important;
+      }
+
+      /* Wider splitter with 3-dot grip so it's visible and easy to grab. */
+      .viewer-splitter {
+        flex: 0 0 6px;
+        cursor: col-resize;
+        background: var(--bg-elev);
+        border-left: 1px solid var(--border);
+        border-right: 1px solid var(--border);
+        position: relative;
+        transition: background 0.15s;
+      }
+      .viewer-splitter::after {
+        content: "";
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        width: 2px;
+        height: 18px;
+        background-image: radial-gradient(circle, var(--muted) 1px, transparent 1.2px);
+        background-size: 2px 5px;
+        background-repeat: repeat-y;
+        opacity: 0.7;
+      }
+      .viewer-splitter:hover,
+      .viewer-splitter.dragging { background: var(--border); }
+      .viewer-splitter:hover::after,
+      .viewer-splitter.dragging::after { opacity: 1; }
+      .viewer-pane.hidden + .viewer-splitter { display: none; }
+
+      /* Logs pane: logs viewer (right), default 70%. */
+      .logs-pane {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
       }
 
       .filters {
         display: flex;
         gap: 4px;
-        flex: 1;
       }
 
       .pill {
@@ -138,6 +243,45 @@
         background: currentColor;
       }
 
+      /* Icon-only buttons for the 3D header (reset / wireframe / shot).
+         Sized like MUI <IconButton size="small" /> (28x28 with 18px icon). */
+      .icon-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: none;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        padding: 0;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+      .icon-btn:hover {
+        color: var(--fg);
+        background: color-mix(in srgb, var(--fg) 8%, transparent);
+      }
+      .icon-btn:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 1px;
+      }
+      .icon-btn:disabled {
+        opacity: 0.35;
+        cursor: not-allowed;
+      }
+      .icon-btn.active {
+        color: var(--accent);
+        background: color-mix(in srgb, var(--accent) 14%, transparent);
+      }
+      .icon-btn svg {
+        width: 18px;
+        height: 18px;
+        display: block;
+        fill: currentColor;
+      }
+
       main {
         flex: 1;
         overflow-y: scroll;
@@ -195,7 +339,8 @@
         font-style: italic;
       }
 
-      footer {
+      footer,
+      .pane-footer {
         padding: 4px 12px;
         font-size: 10.5px;
         color: var(--muted);
@@ -203,33 +348,109 @@
         border-top: 1px solid var(--border);
         display: flex;
         justify-content: space-between;
+        gap: 12px;
         user-select: none;
+        font-variant-numeric: tabular-nums;
+        min-height: 22px;
+        align-items: center;
+      }
+
+      .pane-footer .left,
+      .pane-footer .right {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .pane-footer .right {
+        max-width: 60%;
+      }
+
+      .pane-footer code {
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 10.5px;
+        color: var(--fg);
+        opacity: 0.85;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .pane-footer .dim {
+        opacity: 0.55;
       }
     </style>
   </head>
   <body>
     <div id="root">
-      <header>
-        <span class="title">Logs</span>
-        <div class="filters" id="filters">
-          <button class="pill active" data-level="ALL">All</button>
-          <button class="pill" data-level="INFO">Info</button>
-          <button class="pill" data-level="WARN">Warn</button>
-          <button class="pill" data-level="ERROR">Error</button>
+      <section class="viewer-pane" id="viewerPane" aria-label="3D robot viewer">
+        <div class="pane-header">
+          <button id="viewerReset" class="icon-btn" type="button" title="Reset camera" aria-label="Reset camera">
+            <!-- MUI: center_focus_strong -->
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zM3 5v4h2V5h4V3H5c-1.1 0-2 .9-2 2zm2 10H3v4c0 1.1.9 2 2 2h4v-2H5v-4zm14 4h-4v2h4c1.1 0 2-.9 2-2v-4h-2v4zm0-16h-4v2h4v4h2V5c0-1.1-.9-2-2-2z" />
+            </svg>
+          </button>
+          <button id="viewerWire" class="icon-btn" type="button" title="Toggle wireframe" aria-label="Toggle wireframe" aria-pressed="false">
+            <!-- MUI: grid_view -->
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 3v8h8V3H3zm6 6H5V5h4v4zm-6 4v8h8v-8H3zm6 6H5v-4h4v4zm4-16v8h8V3h-8zm6 6h-4V5h4v4zm-6 4v8h8v-8h-8zm6 6h-4v-4h4v4z" />
+            </svg>
+          </button>
+          <button id="viewerShot" class="icon-btn" type="button" title="Save screenshot (PNG)" aria-label="Save screenshot">
+            <!-- MUI: camera_alt (body + lens cutout) -->
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path fill-rule="evenodd" clip-rule="evenodd" d="M20 4h-3.17L15 2H9L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 13c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z" />
+            </svg>
+          </button>
+          <span class="spacer"></span>
+          <span class="status-pill s-connecting" id="viewerStatus">
+            <span class="label">connecting</span>
+          </span>
         </div>
-        <div class="actions">
-          <button id="toggleFollow" class="toggle on">Follow</button>
-          <button id="copyAll">Copy</button>
-          <button id="clear">Clear</button>
+        <div class="viewer-mount" id="viewerMount"></div>
+        <div class="pane-footer" id="viewerFooter">
+          <div class="left">
+            <span id="viewerFps" class="dim">- fps</span>
+            <span class="dim">·</span>
+            <span id="viewerHz" class="dim">- Hz</span>
+            <span class="dim">·</span>
+            <span id="viewerAge" class="dim">-</span>
+          </div>
+          <div class="right">
+            <code id="viewerPeer" class="dim" title="">no peer</code>
+          </div>
         </div>
-      </header>
-      <main id="main">
-        <div class="empty" id="empty">Waiting for logs&hellip;</div>
-      </main>
-      <footer>
-        <span id="count">0 lines</span>
-        <span>buffer: 2000 lines max</span>
-      </footer>
+      </section>
+      <div class="viewer-splitter" id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize viewer"></div>
+      <section class="logs-pane">
+        <div class="pane-header">
+          <div class="actions">
+            <button id="toggleViewer" class="toggle on" type="button" title="Show/hide 3D viewer">3D</button>
+          </div>
+          <span class="sep" aria-hidden="true"></span>
+          <div class="filters" id="filters">
+            <button class="pill active" data-level="ALL">All</button>
+            <button class="pill" data-level="INFO">Info</button>
+            <button class="pill" data-level="WARN">Warn</button>
+            <button class="pill" data-level="ERROR">Error</button>
+          </div>
+          <span class="spacer"></span>
+          <div class="actions">
+            <button id="toggleFollow" class="toggle on" type="button">Follow</button>
+            <button id="copyAll" type="button">Copy</button>
+            <button id="clear" type="button">Clear</button>
+          </div>
+        </div>
+        <main id="main">
+          <div class="empty" id="empty">Waiting for logs&hellip;</div>
+        </main>
+        <footer>
+          <span id="count">0 lines</span>
+          <span>buffer: 500 lines max</span>
+        </footer>
+      </section>
     </div>
 
     <script type="module">
@@ -244,7 +465,7 @@
       const copyBtn = document.getElementById("copyAll");
       const clearBtn = document.getElementById("clear");
 
-      const MAX_LINES = 2000;
+      const MAX_LINES = 500;
       let activeLevel = "ALL";
       let follow = true;
       const buffer = [];
@@ -391,6 +612,183 @@
       // Live append.
       await listen("log:append", (event) => {
         renderEntry(event.payload);
+      });
+    </script>
+
+    <script type="module">
+      // ─── 3D viewer wiring ────────────────────────────────────────────
+      // The viewer module is loaded lazily so a broken esm.sh fetch
+      // never blocks the logs UI. Toggle, splitter and wireframe state
+      // are persisted in localStorage so the user's choice survives
+      // window reopen.
+
+      // The `.v2` suffix on `size` invalidates pre-30/70-default values
+      // saved by earlier builds so users get the new layout out of the box.
+      const STORAGE = {
+        visible:   "reachyTray.viewer.visible",
+        size:      "reachyTray.viewer.sizePx.v2",
+        wireframe: "reachyTray.viewer.wireframe",
+      };
+
+      const rootEl     = document.getElementById("root");
+      const paneEl     = document.getElementById("viewerPane");
+      const mountEl    = document.getElementById("viewerMount");
+      const statusEl   = document.getElementById("viewerStatus");
+      const splitterEl = document.getElementById("splitter");
+      const toggleBtn  = document.getElementById("toggleViewer");
+      const resetBtn   = document.getElementById("viewerReset");
+      const wireBtn    = document.getElementById("viewerWire");
+      const shotBtn    = document.getElementById("viewerShot");
+      const fpsEl      = document.getElementById("viewerFps");
+      const hzEl       = document.getElementById("viewerHz");
+      const ageEl      = document.getElementById("viewerAge");
+      const peerEl     = document.getElementById("viewerPeer");
+
+      // Restore persisted width (% of root) or fall back to CSS default (30%).
+      const savedSize = parseFloat(localStorage.getItem(STORAGE.size) || "");
+      if (Number.isFinite(savedSize) && savedSize > 10 && savedSize < 90) {
+        paneEl.style.flex = `0 0 ${savedSize}%`;
+      }
+
+      // Restore persisted visibility (default: visible).
+      let viewerVisible = localStorage.getItem(STORAGE.visible) !== "0";
+      function applyViewerVisibility() {
+        paneEl.classList.toggle("hidden", !viewerVisible);
+        toggleBtn.classList.toggle("on", viewerVisible);
+        viewerInstance?.setVisible(viewerVisible);
+      }
+
+      toggleBtn.addEventListener("click", () => {
+        viewerVisible = !viewerVisible;
+        localStorage.setItem(STORAGE.visible, viewerVisible ? "1" : "0");
+        applyViewerVisibility();
+      });
+
+      // Drag-to-resize splitter. Width is stored as a % of the root
+      // container so it scales with window resize.
+      let dragging = false;
+      splitterEl.addEventListener("mousedown", (e) => {
+        dragging = true;
+        splitterEl.classList.add("dragging");
+        document.body.style.cursor = "col-resize";
+        e.preventDefault();
+      });
+      window.addEventListener("mousemove", (e) => {
+        if (!dragging) return;
+        const rect = rootEl.getBoundingClientRect();
+        const ratio = Math.max(0.15, Math.min(0.85, (e.clientX - rect.left) / rect.width));
+        const pct = (ratio * 100).toFixed(2);
+        paneEl.style.flex = `0 0 ${pct}%`;
+      });
+      window.addEventListener("mouseup", () => {
+        if (!dragging) return;
+        dragging = false;
+        splitterEl.classList.remove("dragging");
+        document.body.style.cursor = "";
+        const match = paneEl.style.flex.match(/([0-9.]+)%/);
+        if (match) localStorage.setItem(STORAGE.size, match[1]);
+      });
+
+      // ─── status pill + stats helpers ─────────────────────────────────
+      function setStatusPill(state, meta) {
+        statusEl.className = "status-pill s-" + state;
+        const label = document.createElement("span");
+        label.className = "label";
+        label.textContent = state;
+        statusEl.replaceChildren(label);
+        if (meta) {
+          const m = document.createElement("span");
+          m.className = "meta";
+          m.textContent = "· " + meta;
+          statusEl.append(" ", m);
+        }
+      }
+
+      function fmtAge(ms) {
+        if (!Number.isFinite(ms)) return "-";
+        if (ms < 1000) return `${Math.round(ms)} ms`;
+        return `${(ms / 1000).toFixed(1)} s`;
+      }
+
+      let lastStatus = "connecting";
+      function onStats(stats) {
+        fpsEl.textContent = `${stats.fps} fps`;
+        fpsEl.classList.toggle("dim", stats.fps < 5);
+        hzEl.textContent  = `${stats.wsHz} Hz`;
+        hzEl.classList.toggle("dim", stats.wsHz === 0);
+        ageEl.textContent = fmtAge(stats.lastAgeMs);
+        ageEl.classList.toggle("dim", !Number.isFinite(stats.lastAgeMs));
+
+        // Surface the live Hz next to the status dot.
+        if (lastStatus === "live") {
+          setStatusPill("live", `${stats.wsHz} Hz`);
+        }
+
+        if (stats.peerId || stats.robotName) {
+          const name = stats.robotName || "robot";
+          const short = stats.peerId ? stats.peerId.slice(0, 8) : "";
+          peerEl.textContent = short ? `${name} · ${short}` : name;
+          peerEl.title = stats.peerId ? `${name}\npeer ${stats.peerId}` : name;
+          peerEl.classList.remove("dim");
+        }
+      }
+
+      function onStatusChange(s) {
+        lastStatus = s;
+        setStatusPill(s);
+      }
+
+      // ─── viewer actions (header icon buttons) ────────────────────────
+      resetBtn.addEventListener("click", () => {
+        viewerInstance?.resetCamera();
+      });
+
+      let wireOn = localStorage.getItem(STORAGE.wireframe) === "1";
+      function applyWireUi() {
+        wireBtn.classList.toggle("active", wireOn);
+        wireBtn.setAttribute("aria-pressed", wireOn ? "true" : "false");
+      }
+      applyWireUi();
+
+      wireBtn.addEventListener("click", () => {
+        if (!viewerInstance) return;
+        wireOn = viewerInstance.toggleWireframe();
+        localStorage.setItem(STORAGE.wireframe, wireOn ? "1" : "0");
+        applyWireUi();
+      });
+
+      shotBtn.addEventListener("click", () => {
+        if (!viewerInstance) return;
+        viewerInstance.screenshot();
+        shotBtn.classList.add("active");
+        setTimeout(() => shotBtn.classList.remove("active"), 350);
+      });
+
+      // ─── lazy module load ────────────────────────────────────────────
+      // Errors are caught and surfaced as "unavailable" so the logs
+      // pane keeps working even if the viewer can't initialise.
+      let viewerInstance = null;
+      try {
+        const mod = await import("./viewer.js");
+        viewerInstance = mod.createViewer();
+        await viewerInstance.init(mountEl, {
+          onStatusChange,
+          onStats,
+        });
+        // Re-apply persisted wireframe state.
+        if (wireOn) {
+          viewerInstance.toggleWireframe();
+        }
+      } catch (err) {
+        console.warn("[viewer3d] init failed", err);
+        setStatusPill("error", "unavailable");
+        resetBtn.disabled = wireBtn.disabled = shotBtn.disabled = true;
+      }
+
+      applyViewerVisibility();
+
+      window.addEventListener("beforeunload", () => {
+        try { viewerInstance?.dispose(); } catch {}
       });
     </script>
   </body>

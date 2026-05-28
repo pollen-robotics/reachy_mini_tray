@@ -48,9 +48,11 @@ pub(crate) fn show_logs_window(app: &AppHandle) -> tauri::Result<()> {
     }
 
     WebviewWindowBuilder::new(app, LOGS_WINDOW_LABEL, WebviewUrl::App("logs.html".into()))
-        .title("Reachy Mini - Logs")
-        .inner_size(720.0, 480.0)
-        .min_inner_size(420.0, 240.0)
+        .title("Reachy Mini - Robot")
+        // The window hosts both the 3D viewer (left) and the logs pane (right);
+        // a wider default + larger minimum keeps both panes legible at boot.
+        .inner_size(1200.0, 640.0)
+        .min_inner_size(600.0, 320.0)
         .resizable(true)
         .center()
         .visible(true)
