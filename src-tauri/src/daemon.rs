@@ -25,8 +25,9 @@ use crate::api::{local_client, DAEMON_BASE_URL};
 use crate::commands::FIRST_RUN_WINDOW_LABEL;
 use crate::logs;
 use crate::state::{
-    current_daemon_state, current_generation, current_mode, current_serialport, next_generation,
-    set_daemon_state, AppState, DaemonState, Mode,
+    current_daemon_state, current_generation, current_mode, current_serialport,
+    current_usb_devices, next_generation, set_daemon_state, set_serialport, AppState, DaemonState,
+    Mode,
 };
 use crate::tray_menu::refresh_status;
 
@@ -557,9 +558,20 @@ pub(crate) fn kill_daemon(state: &AppState) {
 }
 
 /// Find any process currently bound to `127.0.0.1:8000` and kill it with
-/// SIGKILL. Used as a pre-flight by `start_daemon` to clean up zombies left
-/// over from crashed previous runs (the kind that show up as
-/// `[Errno 48] address already in use` in the daemon logs).
+/// SIGKILL. Called in two places:
+///
+/// 1. At tray boot (from `lib.rs::setup`), to clean up orphans left over
+///    from a previous tray that died without running its shutdown hook
+///    (SIGKILL from `cargo run` rebuild, panic, `kill -9`, logout). Such
+///    a trampoline gets reparented to launchd (PPID 1) and keeps its
+///    Python child alive, which stays bound to `:8000` and keeps
+///    (de)registering itself on the central relay - visible as a phantom
+///    USB entry flickering in the mobile app.
+/// 2. As a pre-flight in `start_daemon`, belt-and-braces in case an
+///    orphan appeared between boot and the first Start click.
+///
+/// Both paths clean up the same class of zombies (the kind that surface
+/// as `[Errno 48] address already in use` on the next daemon spawn).
 ///
 /// We shell out to `lsof` because it's the only universally-available way
 /// on macOS (no `/proc/net/tcp`) to map a TCP port to its owner pid without
@@ -570,7 +582,7 @@ pub(crate) fn kill_daemon(state: &AppState) {
 /// zombie was itself a parent (e.g. an old trampoline), its Python child
 /// goes down too.
 #[cfg(unix)]
-fn reap_orphaned_daemons() {
+pub(crate) fn reap_orphaned_daemons() {
     let output = match std::process::Command::new("lsof")
         .args(["-nP", "-iTCP:8000", "-sTCP:LISTEN", "-t"])
         .output()
@@ -652,6 +664,38 @@ pub(crate) fn start_daemon(app: &AppHandle) {
         log::info!("daemon already busy, ignoring Start");
         return;
     }
+
+    // Safety net: refuse to launch in USB mode when no Reachy is
+    // physically connected. The daemon would just crash with
+    // `"No Reachy Mini serial port found"` and the central relay
+    // would never register, leaving the user with a confusing
+    // "daemon crashed" state and a robot invisible from the mobile
+    // app. We auto-downgrade to Simulation instead so the daemon
+    // stays usable, and we log the override loudly so the user
+    // understands why the target switched. The menu is already
+    // structured to prevent the user from picking USB explicitly
+    // when no device is detected (see `build_target_submenu`); this
+    // guard catches the edge case where a stale `Mode::Usb` was
+    // persisted from a previous run with a robot plugged in.
+    {
+        let devices = current_usb_devices(&app_state);
+        let mode_now = current_mode(&app_state);
+        if matches!(mode_now, Mode::Usb) && devices.is_empty() {
+            log::warn!(
+                "USB target requested but no Reachy detected; \
+                 auto-falling back to Simulation"
+            );
+            if let Ok(mut guard) = app_state.mode.lock() {
+                *guard = Mode::Simulation;
+            }
+            // Drop the cached serialport too: it would be a stale
+            // path that no longer matches anything plugged in, and
+            // we don't want a future hot-plug to silently re-engage
+            // USB on the next start without an explicit user pick.
+            set_serialport(&app_state, None);
+        }
+    }
+
     let mode = current_mode(&app_state);
     let serialport = current_serialport(&app_state);
 

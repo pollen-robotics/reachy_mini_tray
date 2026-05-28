@@ -37,6 +37,7 @@ mod commands;
 mod daemon;
 mod hf_auth;
 mod logs;
+mod menu_icons;
 mod paths;
 mod state;
 mod tray_icon;
@@ -52,8 +53,8 @@ use crate::commands::{show_first_run_window, show_logs_window};
 use crate::daemon::{kill_daemon, start_daemon, stop_daemon};
 use crate::logs::LogStore;
 use crate::state::{
-    current_daemon_state, current_usb_devices, set_daemon_state, set_serialport, AppState,
-    DaemonState, Mode, QUIT_REQUESTED,
+    current_daemon_state, current_mode, current_usb_devices, set_daemon_state, set_serialport,
+    AppState, DaemonState, Mode, QUIT_REQUESTED,
 };
 use crate::tray_icon::build_icon_cache;
 use crate::tray_menu::{
@@ -97,6 +98,27 @@ pub fn run() {
             // Wire the global logger to the running app so subsequent
             // log records also feed the in-app logs window.
             logs::bind_app_handle(&app_handle);
+
+            // Pre-flight orphan sweep.
+            //
+            // If the previous tray died without passing through
+            // `RunEvent::ExitRequested` (SIGKILL from `cargo run` rebuild,
+            // panic, `kill -9`, forced logout), its `uv-trampoline`
+            // sidecar survives adoption by launchd (PPID becomes 1) and
+            // keeps the Python daemon alive. That zombie stays bound to
+            // `127.0.0.1:8000`, keeps holding the USB serial port, and
+            // keeps re-registering itself on the central relay - which
+            // surfaces as a phantom USB entry flickering in the mobile
+            // app (15 s TTL sweep vs. orphan re-registration).
+            //
+            // The single-instance plugin above only prevents a second
+            // *tray* from launching; it does nothing about surviving
+            // daemons. `start_daemon` also calls `reap_orphaned_daemons`
+            // right before spawning, but that only helps if the user
+            // clicks Start - an orphan can live indefinitely between
+            // tray relaunches otherwise. Sweeping here closes that gap.
+            #[cfg(unix)]
+            daemon::reap_orphaned_daemons();
 
             // ---- Initial tray menu ----
             //
@@ -260,25 +282,42 @@ pub fn run() {
                 initial_count,
                 initial_changed
             );
-            // First-launch UX guard: if no robot is plugged in AND we
-            // are about to start the long bootstrap (uv download / venv
-            // creation / etc.), default the connection mode to
-            // Simulation so the daemon doesn't crash with "no serial
-            // port" right after setup completes. The user can always
-            // switch to USB once a robot is plugged in. We only do this
-            // BEFORE bootstrap; on subsequent launches the user's last
-            // choice (USB) wins.
-            if !paths::is_bootstrap_done() && initial_count == 0 {
+            // Boot-time mode reconciliation.
+            //
+            // The mode in `AppState` defaults to `Mode::Usb` (and a
+            // future revision could persist the user's last choice).
+            // If we land at boot with no Reachy plugged in but the
+            // mode says USB, we MUST downgrade to Simulation - else
+            // an auto-start (first-launch path below, or `start_daemon`
+            // wired to `Toggle`) would crash the daemon with "No
+            // Reachy Mini serial port found". The fallback is
+            // unconditional now: previously we restricted it to
+            // first-launch, but the same crash happens on subsequent
+            // launches when the user unplugged the robot before
+            // quitting the tray.
+            //
+            // Re-engaging USB requires an explicit user pick from
+            // the Robot submenu (which only exposes USB rows when a
+            // device is detected), so this fallback can never strand
+            // a connected robot in sim mode.
+            if initial_count == 0 {
                 let app_state = app.state::<AppState>();
-                if let Ok(mut guard) = app_state.mode.lock() {
-                    *guard = Mode::Simulation;
+                let was_usb = matches!(current_mode(&app_state), Mode::Usb);
+                if was_usb {
+                    if let Ok(mut guard) = app_state.mode.lock() {
+                        *guard = Mode::Simulation;
+                    }
+                    log::info!(
+                        "no Reachy detected at boot: defaulting to Simulation \
+                         (plug a robot in and pick it from the Robot submenu \
+                         to switch back to USB)"
+                    );
+                    // The mode change above happened after `scan_and_apply`
+                    // already requested a refresh (or didn't, if cache was
+                    // unchanged); force an explicit refresh so the menu
+                    // reflects the new mode immediately.
+                    refresh_status(&app_handle);
                 }
-                log::info!("first-launch with no Reachy detected: defaulting to Simulation");
-                // The mode change above happened after `scan_and_apply`
-                // already requested a refresh (or didn't, if cache was
-                // unchanged); force an explicit refresh so the menu
-                // reflects the new mode immediately.
-                refresh_status(&app_handle);
             }
             usb::start_scanner(app_handle.clone());
 
