@@ -8,10 +8,13 @@
 //! `hf_auth::start_status_poller` and by daemon FSM transitions, so we
 //! don't actually rebuild the menu on every poll tick.
 
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{
+    CheckMenuItem, IconMenuItem, Menu, MenuItem, NativeIcon, PredefinedMenuItem, Submenu,
+};
 use tauri::{AppHandle, Manager, Wry};
 
 use crate::hf_auth;
+use crate::menu_icons;
 use crate::state::{
     current_daemon_state, current_mode, current_serialport, current_usb_devices, AppState,
     DaemonState, IconCache, Mode,
@@ -19,6 +22,15 @@ use crate::state::{
 
 pub(crate) const TRAY_ID: &str = "main";
 
+/// Always-disabled informational row at the very top of the tray menu.
+/// Carries a colored status dot (`StatusAvailable` / `StatusPartiallyAvailable`
+/// / `StatusUnavailable` / `StatusNone`) plus a sentence describing the
+/// daemon's FSM state. Mirrors the "Docker Desktop is running" header in
+/// Docker's macOS tray menu.
+///
+/// The id is wired up only so we can reference the row by a stable string
+/// in tests / tooling - clicks on a disabled item are no-ops.
+pub(crate) const ID_STATUS: &str = "status";
 pub(crate) const ID_TOGGLE: &str = "toggle";
 pub(crate) const ID_TARGET_SUBMENU: &str = "target";
 /// Prefix for individual USB-device menu items. The full ID is
@@ -229,14 +241,63 @@ pub(crate) fn build_tray_menu(
     usb_devices: &[crate::usb::UsbDevice],
     snap: &hf_auth::AuthSnapshot,
 ) -> tauri::Result<Menu<Wry>> {
+    // ---- Status row (always disabled, top of menu) ----
+    //
+    // Mirrors Docker Desktop's "Docker Desktop is running" header: a
+    // permanent informational row at the very top of the menu, with a
+    // colored native dot icon that matches the tray icon's tint. Lets
+    // the user read the daemon's FSM state without having to map the
+    // tray-icon tint to a meaning.
+    let status_row = build_status_row(app, state)?;
+
     // ---- Toggle (Start / Stop / Restart) ----
-    let (toggle_text, toggle_enabled) = match state {
-        DaemonState::Idle => ("Start daemon", true),
-        DaemonState::Starting => ("Starting\u{2026}", false),
-        DaemonState::Running => ("Stop daemon", true),
-        DaemonState::Crashed => ("Restart daemon", true),
+    //
+    // Icon sourcing:
+    //   - Idle     -> custom play glyph   (▶, filled triangle)
+    //   - Starting -> NativeIcon::RefreshFreestanding (busy / spinner)
+    //   - Running  -> custom stop glyph   (■, filled rounded square)
+    //   - Crashed  -> NativeIcon::Refresh (↻ retry)
+    //
+    // Play / Stop are baked procedurally in `menu_icons` because the
+    // native `RightFacingTriangle` reads as a thin chevron at the menu
+    // -item icon size, which gives a "next page" affordance rather than
+    // the "press to start" play-button cue users expect from Docker
+    // Desktop, Spotify, etc. The custom glyphs match SF Symbols'
+    // `play.fill` / `stop.fill` weight and read clearly at 22 pt.
+    let toggle = match state {
+        DaemonState::Idle => IconMenuItem::with_id(
+            app,
+            ID_TOGGLE,
+            "Start daemon",
+            true,
+            Some(menu_icons::play_icon()),
+            None::<&str>,
+        )?,
+        DaemonState::Running => IconMenuItem::with_id(
+            app,
+            ID_TOGGLE,
+            "Stop daemon",
+            true,
+            Some(menu_icons::stop_icon()),
+            None::<&str>,
+        )?,
+        DaemonState::Starting => IconMenuItem::with_id_and_native_icon(
+            app,
+            ID_TOGGLE,
+            "Starting\u{2026}",
+            false,
+            Some(NativeIcon::RefreshFreestanding),
+            None::<&str>,
+        )?,
+        DaemonState::Crashed => IconMenuItem::with_id_and_native_icon(
+            app,
+            ID_TOGGLE,
+            "Restart daemon",
+            true,
+            Some(NativeIcon::Refresh),
+            None::<&str>,
+        )?,
     };
-    let toggle = MenuItem::with_id(app, ID_TOGGLE, toggle_text, toggle_enabled, None::<&str>)?;
 
     // ---- Robot submenu ----
     let busy = matches!(state, DaemonState::Starting | DaemonState::Running);
@@ -262,13 +323,19 @@ pub(crate) fn build_tray_menu(
 
     // Predefined separators are cheap and `muda` requires distinct
     // instances per insertion site. Build all we might need up-front.
+    let sep_status = PredefinedMenuItem::separator(app)?;
     let sep_top = PredefinedMenuItem::separator(app)?;
     let sep_account = PredefinedMenuItem::separator(app)?;
     let sep_footer = PredefinedMenuItem::separator(app)?;
     let sep_quit = PredefinedMenuItem::separator(app)?;
 
-    let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =
-        vec![&toggle, &sep_top, &target_submenu];
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = vec![
+        &status_row,
+        &sep_status,
+        &toggle,
+        &sep_top,
+        &target_submenu,
+    ];
 
     match &account {
         AccountSlot::Flat(item) => {
@@ -289,6 +356,36 @@ pub(crate) fn build_tray_menu(
     items.push(&quit);
 
     Menu::with_items(app, &items)
+}
+
+/// Build the always-disabled status row at the top of the tray menu.
+///
+/// The native icon is one of the four `Status*` colored dots, which on
+/// macOS render as small circles tinted by the system. Combined with a
+/// short sentence ("Daemon is running" / etc.), the row gives the user
+/// a one-glance read on the daemon's FSM state, doubling the signal
+/// already carried by the tray icon's tint - on a multi-tray menu bar
+/// that signal is otherwise easy to lose.
+fn build_status_row(app: &AppHandle, state: DaemonState) -> tauri::Result<IconMenuItem<Wry>> {
+    let (text, icon) = match state {
+        DaemonState::Idle => ("Daemon is idle", NativeIcon::StatusNone),
+        DaemonState::Starting => (
+            "Daemon is starting\u{2026}",
+            NativeIcon::StatusPartiallyAvailable,
+        ),
+        DaemonState::Running => ("Daemon is running", NativeIcon::StatusAvailable),
+        DaemonState::Crashed => ("Daemon has crashed", NativeIcon::StatusUnavailable),
+    };
+    IconMenuItem::with_id_and_native_icon(
+        app,
+        ID_STATUS,
+        text,
+        // Disabled: purely informational. Clicks are a no-op so we
+        // don't need a router entry for `ID_STATUS`.
+        false,
+        Some(icon),
+        None::<&str>,
+    )
 }
 
 /// Build the `Robot` submenu, dynamically populated with the detected
