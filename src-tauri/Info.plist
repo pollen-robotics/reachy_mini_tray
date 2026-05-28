@@ -8,5 +8,33 @@
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+
+    <!--
+        macOS privacy usage descriptions.
+
+        These are required IN ADDITION to the entitlements declared in
+        `python-entitlements.plist` (which let the signed Python sidecar
+        ASK for the corresponding TCC permissions). Without a usage
+        description string here, macOS does not surface the permission
+        prompt the first time the app touches the device. The result is
+        silent failure: the audio capture API succeeds but every frame
+        is digital silence (with the occasional bit of analog noise
+        leaking through, which reads as random small jumps on a level
+        meter - exactly the symptom we hit on USB-mode conversation,
+        where the Python daemon runs as a tray sidecar on this Mac
+        rather than on the robot's Pi).
+
+        The Wi-Fi mode wasn't affected because in that path the daemon
+        runs on the robot itself; macOS isn't in the audio capture
+        path at all.
+
+        The strings are user-facing: macOS displays them verbatim in
+        the permission prompt, so they describe WHY the app needs
+        each device.
+    -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Reachy Mini needs access to the microphone so it can relay your voice to the robot during conversations.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Reachy Mini may use the camera for vision-based features. Decline to keep the conversation working without video.</string>
 </dict>
 </plist>
