@@ -554,37 +554,60 @@ pub(crate) fn kill_daemon(state: &AppState) {
         // grandchild that survived because Python forked workers (rare,
         // but uvicorn's `--reload` mode does it).
         kill_process_group(pid as i32, libc::SIGKILL);
+
+        // Phase 4: last-resort sweep by listening port. If the trampoline
+        // was built without `setpgid` (old binary) the group kill above is a
+        // no-op and Python would otherwise survive as an orphan on
+        // `:8000` / `:8443`. Reaping by port catches exactly that case.
+        reap_orphaned_daemons();
     }
 }
 
-/// Find any process currently bound to `127.0.0.1:8000` and kill it with
-/// SIGKILL. Called in two places:
+/// Ports the daemon listens on. `:8000` is the HTTP API, `:8443` the
+/// GStreamer WebRTC signaling server. A zombie daemon holds *both*, so we
+/// sweep both to be sure we don't leave a half-dead process around.
+#[cfg(unix)]
+const DAEMON_LISTEN_PORTS: [&str; 2] = ["8000", "8443"];
+
+/// Find any process currently bound to one of [`DAEMON_LISTEN_PORTS`] and
+/// kill it with SIGKILL. Called in several places:
 ///
 /// 1. At tray boot (from `lib.rs::setup`), to clean up orphans left over
 ///    from a previous tray that died without running its shutdown hook
 ///    (SIGKILL from `cargo run` rebuild, panic, `kill -9`, logout). Such
 ///    a trampoline gets reparented to launchd (PPID 1) and keeps its
-///    Python child alive, which stays bound to `:8000` and keeps
+///    Python child alive, which stays bound to `:8000` / `:8443` and keeps
 ///    (de)registering itself on the central relay - visible as a phantom
 ///    USB entry flickering in the mobile app.
 /// 2. As a pre-flight in `start_daemon`, belt-and-braces in case an
 ///    orphan appeared between boot and the first Start click.
+/// 3. As a post-kill sweep in [`kill_daemon`], in case the explicit
+///    process-group kill missed the Python child (e.g. an old trampoline
+///    binary built without `setpgid`, or a slow async shutdown).
 ///
-/// Both paths clean up the same class of zombies (the kind that surface
+/// All paths clean up the same class of zombies (the kind that surface
 /// as `[Errno 48] address already in use` on the next daemon spawn).
 ///
 /// We shell out to `lsof` because it's the only universally-available way
 /// on macOS (no `/proc/net/tcp`) to map a TCP port to its owner pid without
-/// adding a 2 MB networking crate. `lsof -nP -iTCP:8000 -sTCP:LISTEN -t`
-/// prints one pid per line and exits 1 if nothing matches - both are fine.
+/// adding a 2 MB networking crate. `lsof -nP -iTCP:8000 -iTCP:8443
+/// -sTCP:LISTEN -t` prints one pid per line and exits 1 if nothing matches
+/// - both are fine.
 ///
 /// Belt-and-braces: also nukes the killed pid's process group, so if the
 /// zombie was itself a parent (e.g. an old trampoline), its Python child
 /// goes down too.
 #[cfg(unix)]
 pub(crate) fn reap_orphaned_daemons() {
+    let mut lsof_args: Vec<String> = vec!["-nP".to_string()];
+    for port in DAEMON_LISTEN_PORTS {
+        lsof_args.push(format!("-iTCP:{}", port));
+    }
+    lsof_args.push("-sTCP:LISTEN".to_string());
+    lsof_args.push("-t".to_string());
+
     let output = match std::process::Command::new("lsof")
-        .args(["-nP", "-iTCP:8000", "-sTCP:LISTEN", "-t"])
+        .args(&lsof_args)
         .output()
     {
         Ok(o) => o,
@@ -594,32 +617,53 @@ pub(crate) fn reap_orphaned_daemons() {
         }
     };
 
+    // A process listening on both ports shows up once per port, so dedup
+    // while preserving order.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pids: Vec<i32> = stdout
-        .lines()
-        .filter_map(|s| s.trim().parse::<i32>().ok())
-        .collect();
+    let mut pids: Vec<i32> = Vec::new();
+    for pid in stdout.lines().filter_map(|s| s.trim().parse::<i32>().ok()) {
+        if !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
 
     if pids.is_empty() {
         return;
     }
 
     log::warn!(
-        "found {} orphan process(es) on TCP/8000, killing: {:?}",
+        "found {} orphan process(es) on TCP/{:?}, killing: {:?}",
         pids.len(),
+        DAEMON_LISTEN_PORTS,
         pids
     );
 
+    // Our own process group. In dev (`yarn dev`) the tray binary, the shell
+    // job and a daemon child that failed to `setpgid` into its own group can
+    // all share this single group. We must never `killpg` it, or we SIGKILL
+    // the tray (and `yarn dev`) itself - observed as exit 137 + the app
+    // closing whenever the daemon is restarted with a leftover orphan around.
+    // SAFETY: getpgrp(2) is a libc syscall.
+    let own_pgid = unsafe { libc::getpgrp() };
+
     for pid in pids {
-        // SAFETY: kill(2)/killpg(2) are libc syscalls.
+        // SAFETY: kill(2)/killpg(2)/getpgid(2) are libc syscalls.
         unsafe {
-            // First the whole group (catches forked workers).
+            // First the whole group (catches forked workers) - but only if
+            // it isn't our own group, otherwise we'd take the tray down too.
             let pgid = libc::getpgid(pid);
-            if pgid > 1 {
+            if pgid > 1 && pgid != own_pgid {
                 libc::killpg(pgid, libc::SIGKILL);
+            } else if pgid == own_pgid {
+                log::warn!(
+                    "orphan pid={} shares the tray's process group ({}); \
+                     killing the pid directly instead of the group",
+                    pid,
+                    pgid
+                );
             }
-            // Then the pid itself, in case its pgid was the tray's own
-            // group (unlikely but cheap to guard against).
+            // Then the pid itself: always safe (it's the orphan, never us),
+            // and the only thing we can do when the orphan shares our group.
             libc::kill(pid, libc::SIGKILL);
         }
     }
@@ -637,6 +681,20 @@ pub(crate) fn reap_orphaned_daemons() {
 fn kill_process_group(pgid: i32, sig: i32) {
     if pgid <= 1 {
         log::warn!("refusing killpg with pgid={}", pgid);
+        return;
+    }
+    // Refuse to nuke our own process group. In dev (`yarn dev`) a trampoline
+    // whose `setpgid(0, 0)` didn't take effect stays in the tray's group;
+    // killpg() on it would SIGKILL the tray itself. The caller has already
+    // `.kill()`ed the trampoline child directly, so skipping the group here
+    // only loses the (rare) forked-worker reap, not the main kill.
+    // SAFETY: getpgrp(2) is a libc syscall.
+    let own_pgid = unsafe { libc::getpgrp() };
+    if pgid == own_pgid {
+        log::warn!(
+            "refusing killpg on the tray's own process group ({})",
+            pgid
+        );
         return;
     }
     // SAFETY: killpg(2) is a libc syscall, no Rust invariants to uphold.
