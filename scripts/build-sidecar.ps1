@@ -5,7 +5,7 @@
 #     to ..\reachy_mini_desktop_app\uv-wrapper (sibling of reachy_mini_tray).
 #   - Destination is src-tauri\binaries\uv-trampoline-<triplet>.exe.
 #   - Selecting which `reachy-mini` Python package to bake in:
-#       default                 -> latest from PyPI
+#       default                 -> pinned version from ..\daemon-version.txt
 #       $env:REACHY_MINI_SOURCE -> git branch on pollen-robotics/reachy_mini
 #       $env:REACHY_MINI_VERSION-> pin a specific PyPI version
 #       First positional arg    -> shortcut for REACHY_MINI_SOURCE.
@@ -36,6 +36,20 @@ if ($env:UV_WRAPPER_DIR) {
 $DstDir = Join-Path $TrayRoot 'src-tauri\binaries'
 $SpecMarker = Join-Path $DstDir '.reachy_mini_spec'
 
+# Committed default pin: single source of truth for the shipped reachy-mini
+# version. Read only when no explicit env / branch override is given.
+$PinFile = Join-Path $TrayRoot 'daemon-version.txt'
+
+# Return the first bare (non-comment, non-blank) line of the pin file, or ''.
+function Resolve-Pin($path) {
+    if (-not (Test-Path $path)) { return '' }
+    foreach ($line in Get-Content $path) {
+        $t = $line.Trim()
+        if ($t -and -not $t.StartsWith('#')) { return $t }
+    }
+    return ''
+}
+
 if (-not (Test-Path $SrcCrate)) {
     Write-Error "Cannot find uv-wrapper crate at $SrcCrate. Either set `$env:UV_WRAPPER_DIR or check out reachy_mini_desktop_app as a sibling of reachy_mini_tray."
     exit 1
@@ -50,12 +64,26 @@ if ($BranchOrPypi -and -not $env:REACHY_MINI_SOURCE) {
     $env:REACHY_MINI_SOURCE = $BranchOrPypi
 }
 
+# Resolution precedence (first match wins):
+#   1. $env:REACHY_MINI_VERSION         -> reachy-mini==X.Y.Z
+#   2. $env:REACHY_MINI_SOURCE (!=pypi) -> git+...@branch
+#   3. committed daemon-version.txt     -> reachy-mini==<pin>
+#   4. fallback                         -> reachy-mini (latest from PyPI)
+# The pin path (3) sets $env:REACHY_MINI_VERSION so `option_env!` in the
+# trampoline bakes the exact version in at compile time (build.rs reruns when
+# this var changes).
 if ($env:REACHY_MINI_VERSION) {
     $Spec = "reachy-mini==$($env:REACHY_MINI_VERSION)"
 } elseif ($env:REACHY_MINI_SOURCE -and $env:REACHY_MINI_SOURCE -ne 'pypi') {
     $Spec = "git+https://github.com/pollen-robotics/reachy_mini.git@$($env:REACHY_MINI_SOURCE)"
 } else {
-    $Spec = 'reachy-mini (latest from PyPI)'
+    $Pin = Resolve-Pin $PinFile
+    if ($Pin) {
+        $env:REACHY_MINI_VERSION = $Pin
+        $Spec = "reachy-mini==$Pin"
+    } else {
+        $Spec = 'reachy-mini (latest from PyPI)'
+    }
 }
 
 Write-Host "📦 Bake-in spec: $Spec"

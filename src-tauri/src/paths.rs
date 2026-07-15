@@ -83,6 +83,30 @@ pub fn is_bootstrap_done() -> bool {
     venv_python_path().map(|p| p.exists()).unwrap_or(false)
 }
 
+/// Path to the Python interpreter inside an arbitrary venv (e.g. `.venv`
+/// or `apps_venv`) in the shared data dir. Mirrors
+/// `uv_wrapper::python_exe_path(data_dir, venv_name)`.
+pub fn venv_python_for(venv_name: &str) -> Option<PathBuf> {
+    let venv = data_dir()?.join(venv_name);
+    if cfg!(target_os = "windows") {
+        Some(venv.join("Scripts").join("python.exe"))
+    } else {
+        Some(venv.join("bin").join("python3"))
+    }
+}
+
+/// Path to the `uv` executable the trampoline downloaded into the data dir.
+/// Mirrors `uv_wrapper::uv_exe_path(data_dir)`. The tray reuses it to run
+/// `uv pip install -U` for a user-triggered daemon upgrade.
+pub fn uv_exe_path() -> Option<PathBuf> {
+    let dir = data_dir()?;
+    if cfg!(target_os = "windows") {
+        Some(dir.join("uv.exe"))
+    } else {
+        Some(dir.join("uv"))
+    }
+}
+
 /// Wipe the `.venv` directory (and its sibling `apps_venv` if present) so
 /// the next launch reruns the full first-time setup. Triggered by the
 /// `Reset setup…` tray menu item.

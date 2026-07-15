@@ -20,12 +20,12 @@ log                            = "=0.4.22"
 serde                          = { version = "=1.0.219", features = ["derive"] }
 serde_json                     = "=1.0.140"
 # Blocking HTTP client used to poll the daemon's `/daemon/status` readiness
-# endpoint and the `/api/hf-auth/*` routes from the account submenu. Plain
-# HTTP only (loopback), so we disable every TLS feature to keep the binary
-# lean. `reqwest` is already pulled transitively by `tauri-plugin-shell`, so
-# making it a direct dep adds no new build cost. `json` enables the
-# convenience `.json::<T>()` decoder used in `hf_auth.rs`.
-reqwest                        = { version = "=0.13.2", default-features = false, features = ["blocking", "json"] }
+# endpoint and the `/api/hf-auth/*` routes (loopback, no TLS needed), plus the
+# GitHub Releases API check in `daemon_update.rs` (HTTPS, hence the `rustls`
+# feature - reqwest 0.13's default TLS provider, which also matches what
+# `tauri-plugin-shell` already pulls transitively so we add no new backend).
+# `json` enables the `.json::<T>()` decoder.
+reqwest                        = { version = "=0.13.2", default-features = false, features = ["blocking", "json", "rustls"] }
 # Cross-platform USB serial-port enumeration. We use it (read-only) to
 # detect Reachy Mini devices plugged via USB so the tray menu can list
 # them by name and let the user pick one. We never actually open the port

@@ -13,6 +13,7 @@ use tauri::menu::{
 };
 use tauri::{AppHandle, Manager, Wry};
 
+use crate::daemon_update::{self, UpdateSnapshot};
 use crate::hf_auth;
 use crate::menu_icons;
 use crate::state::{
@@ -51,6 +52,9 @@ pub(crate) const ID_ACCOUNT_SIGNOUT: &str = "account_signout";
 pub(crate) const ID_ACCOUNT_REFRESH_RELAY: &str = "account_refresh_relay";
 pub(crate) const ID_SHOW_LOGS: &str = "show_logs";
 pub(crate) const ID_RESET_SETUP: &str = "reset_setup";
+/// Shown only when a newer daemon release is available (or an upgrade is in
+/// flight). Click triggers `daemon_update::start_update`.
+pub(crate) const ID_UPDATE_DAEMON: &str = "update_daemon";
 pub(crate) const ID_QUIT: &str = "quit";
 
 /// Top-level entry point: re-render icon, tooltip and menu from the live
@@ -102,8 +106,12 @@ pub(crate) fn refresh_status(app: &AppHandle) {
         .try_state::<hf_auth::AuthStatusStore>()
         .map(|s| s.snapshot())
         .unwrap_or_default();
+    let update = app
+        .try_state::<daemon_update::DaemonUpdateStore>()
+        .map(|s| s.snapshot())
+        .unwrap_or_default();
     let devices = current_usb_devices(&app_state);
-    match build_tray_menu(app, state, mode, serialport.as_deref(), &devices, &snap) {
+    match build_tray_menu(app, state, mode, serialport.as_deref(), &devices, &snap, &update) {
         Ok(menu) => {
             if let Err(e) = tray.set_menu(Some(menu)) {
                 log::warn!("set_menu failed: {}", e);
@@ -240,6 +248,7 @@ pub(crate) fn build_tray_menu(
     serialport: Option<&str>,
     usb_devices: &[crate::usb::UsbDevice],
     snap: &hf_auth::AuthSnapshot,
+    update: &UpdateSnapshot,
 ) -> tauri::Result<Menu<Wry>> {
     // ---- Status row (always disabled, top of menu) ----
     //
@@ -321,11 +330,48 @@ pub(crate) fn build_tray_menu(
     )?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
 
+    // ---- Daemon update row ----
+    //
+    // Rendered only when the version poller (`daemon_update`) found a newer
+    // daemon release than the one installed in `.venv`, or while a
+    // user-triggered upgrade is running. Absent otherwise so the menu stays
+    // clean on an up-to-date install.
+    let update_row: Option<IconMenuItem<Wry>> = if update.updating {
+        Some(IconMenuItem::with_id_and_native_icon(
+            app,
+            ID_UPDATE_DAEMON,
+            "Updating daemon\u{2026}",
+            false,
+            Some(NativeIcon::RefreshFreestanding),
+            None::<&str>,
+        )?)
+    } else if update.available() {
+        let label = match (update.installed, update.latest) {
+            (Some(i), Some(l)) => format!(
+                "Update daemon ({} \u{2192} {})",
+                daemon_update::fmt_version(i),
+                daemon_update::fmt_version(l)
+            ),
+            _ => "Update daemon".to_string(),
+        };
+        Some(IconMenuItem::with_id_and_native_icon(
+            app,
+            ID_UPDATE_DAEMON,
+            &label,
+            true,
+            Some(NativeIcon::Refresh),
+            None::<&str>,
+        )?)
+    } else {
+        None
+    };
+
     // Predefined separators are cheap and `muda` requires distinct
     // instances per insertion site. Build all we might need up-front.
     let sep_status = PredefinedMenuItem::separator(app)?;
     let sep_top = PredefinedMenuItem::separator(app)?;
     let sep_account = PredefinedMenuItem::separator(app)?;
+    let sep_update = PredefinedMenuItem::separator(app)?;
     let sep_footer = PredefinedMenuItem::separator(app)?;
     let sep_quit = PredefinedMenuItem::separator(app)?;
 
@@ -347,6 +393,13 @@ pub(crate) fn build_tray_menu(
             items.push(sub);
         }
         AccountSlot::Hidden => {}
+    }
+
+    // Update row sits in its own section just above the footer so it reads
+    // as an action on the daemon, not part of the account block.
+    if let Some(row) = update_row.as_ref() {
+        items.push(&sep_update);
+        items.push(row);
     }
 
     items.push(&sep_footer);

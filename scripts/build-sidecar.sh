@@ -11,7 +11,8 @@
 # It picks the right one at runtime based on the host architecture.
 #
 # Selecting which `reachy-mini` Python package to bake in:
-#   - default            → latest from PyPI (production)
+#   - default            → pinned version from ../daemon-version.txt
+#                          (committed, deterministic, what releases ship)
 #   - REACHY_MINI_SOURCE → git branch on pollen-robotics/reachy_mini
 #                          (e.g. `develop`, `integration/mobile-app-daemon`)
 #   - REACHY_MINI_VERSION → pin a specific PyPI version (e.g. `1.6.4`)
@@ -19,7 +20,7 @@
 #     REACHY_MINI_SOURCE without exporting the env var manually.
 #
 # Examples:
-#   ./scripts/build-sidecar.sh                        # PyPI latest
+#   ./scripts/build-sidecar.sh                        # pinned daemon-version.txt
 #   ./scripts/build-sidecar.sh integration/mobile-app-daemon
 #   REACHY_MINI_SOURCE=develop ./scripts/build-sidecar.sh
 #   REACHY_MINI_VERSION=1.6.4 ./scripts/build-sidecar.sh
@@ -48,6 +49,11 @@ fi
 DST_DIR="$TRAY_ROOT/src-tauri/binaries"
 SPEC_MARKER="$DST_DIR/.reachy_mini_spec"
 
+# Committed default pin: the single source of truth for which reachy-mini
+# version a tray release ships. Read only when no explicit env / branch
+# override is given (see resolution block below).
+PIN_FILE="$TRAY_ROOT/daemon-version.txt"
+
 if [[ ! -d "$SRC_CRATE" ]]; then
     echo "Error: cannot find uv-wrapper crate at $SRC_CRATE" >&2
     echo "Either set UV_WRAPPER_DIR to point to a local clone of" >&2
@@ -68,12 +74,33 @@ if [[ $# -ge 1 && -n "${1:-}" ]]; then
     fi
 fi
 
+# Read the committed pin, ignoring comments and blank lines (first bare line
+# wins). Empty when the file is missing or only contains comments.
+read_pin() {
+    [[ -f "$PIN_FILE" ]] || return 0
+    grep -vE '^[[:space:]]*(#|$)' "$PIN_FILE" | head -1 | tr -d '[:space:]'
+}
+
+# Resolution precedence (first match wins):
+#   1. REACHY_MINI_VERSION env         -> reachy-mini==X.Y.Z
+#   2. REACHY_MINI_SOURCE env (!=pypi) -> git+...@branch
+#   3. committed daemon-version.txt    -> reachy-mini==<pin>
+#   4. fallback                        -> reachy-mini (latest from PyPI)
+# The pin path (3) exports REACHY_MINI_VERSION so `option_env!` in the
+# trampoline's get_reachy_mini_spec() bakes the exact version in at compile
+# time (build.rs already reruns when this var changes).
 if [[ -n "${REACHY_MINI_VERSION:-}" ]]; then
     SPEC="reachy-mini==${REACHY_MINI_VERSION}"
 elif [[ -n "${REACHY_MINI_SOURCE:-}" && "${REACHY_MINI_SOURCE}" != "pypi" ]]; then
     SPEC="git+https://github.com/pollen-robotics/reachy_mini.git@${REACHY_MINI_SOURCE}"
 else
-    SPEC="reachy-mini (latest from PyPI)"
+    PIN="$(read_pin)"
+    if [[ -n "$PIN" ]]; then
+        export REACHY_MINI_VERSION="$PIN"
+        SPEC="reachy-mini==${PIN}"
+    else
+        SPEC="reachy-mini (latest from PyPI)"
+    fi
 fi
 
 echo "📦 Bake-in spec: ${SPEC}"

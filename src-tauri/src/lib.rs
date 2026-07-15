@@ -24,17 +24,21 @@
 //! - [`tray_menu`]: dynamic menu construction + `refresh_status` entry point.
 //! - [`commands`]: webview window helpers and Tauri IPC commands.
 //! - [`hf_auth`]: Hugging Face OAuth orchestrator + status poller.
+//! - [`daemon_update`]: GitHub-release version check + in-place venv upgrade.
 //! - [`api`]: daemon base URL + shared `reqwest` client factory.
 //! - [`logs`]: in-memory ring-buffer logger.
 //! - [`paths`]: data-dir layout (shared with `reachy_mini_desktop_app`).
 //! - [`usb`]: enumerate / filter Reachy Mini USB-serial devices.
 //!
-//! Explicitly out of scope: auto-update, autostart-at-login, system
-//! sleep/wake reconciliation, Windows / Linux code-signing pipelines.
+//! Explicitly out of scope: tray-app auto-update (the Tauri bundle updater),
+//! autostart-at-login, system sleep/wake reconciliation, Windows / Linux
+//! code-signing pipelines. Note that *daemon* (Python `reachy-mini`) updates
+//! ARE in scope - see [`daemon_update`].
 
 mod api;
 mod commands;
 mod daemon;
+mod daemon_update;
 mod hf_auth;
 mod logs;
 mod menu_icons;
@@ -60,7 +64,7 @@ use crate::tray_icon::build_icon_cache;
 use crate::tray_menu::{
     build_tray_menu, refresh_status, ID_ACCOUNT_REFRESH_RELAY, ID_ACCOUNT_SIGNIN,
     ID_ACCOUNT_SIGNOUT, ID_ACCOUNT_SUBMENU, ID_QUIT, ID_RESET_SETUP, ID_SHOW_LOGS, ID_TARGET_SIM,
-    ID_TARGET_USB_PREFIX, ID_TOGGLE, TRAY_ID,
+    ID_TARGET_USB_PREFIX, ID_TOGGLE, ID_UPDATE_DAEMON, TRAY_ID,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -87,6 +91,7 @@ pub fn run() {
         .manage(AppState::new())
         .manage(LogStore::new())
         .manage(hf_auth::AuthStatusStore::new())
+        .manage(daemon_update::DaemonUpdateStore::new())
         .invoke_handler(tauri::generate_handler![
             commands::close_first_run_window,
             commands::get_logs,
@@ -127,6 +132,7 @@ pub fn run() {
             // empty auth). Topology and labels will adjust as soon as
             // state changes.
             let initial_snap = hf_auth::AuthSnapshot::default();
+            let initial_update = daemon_update::UpdateSnapshot::default();
             let menu = build_tray_menu(
                 &app.handle().clone(),
                 DaemonState::Idle,
@@ -134,6 +140,7 @@ pub fn run() {
                 None,
                 &[],
                 &initial_snap,
+                &initial_update,
             )?;
 
             // ---- Icon cache ----
@@ -154,6 +161,14 @@ pub fn run() {
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     ID_TOGGLE => {
+                        // A daemon upgrade stops/starts the daemon and mutates
+                        // the venv it runs from; a concurrent Start/Stop would
+                        // race the in-flight `uv pip install`. Ignore until the
+                        // upgrade thread clears the flag.
+                        if app.state::<daemon_update::DaemonUpdateStore>().updating() {
+                            log::info!("toggle ignored: daemon upgrade in progress");
+                            return;
+                        }
                         let app_state = app.state::<AppState>();
                         match current_daemon_state(&app_state) {
                             DaemonState::Idle | DaemonState::Crashed => start_daemon(app),
@@ -161,6 +176,9 @@ pub fn run() {
                             // Disabled while Starting; defensive no-op.
                             DaemonState::Starting => {}
                         }
+                    }
+                    ID_UPDATE_DAEMON => {
+                        daemon_update::start_update(app);
                     }
                     ID_TARGET_SIM => {
                         let app_state = app.state::<AppState>();
@@ -231,6 +249,12 @@ pub fn run() {
                         }
                     }
                     ID_RESET_SETUP => {
+                        // Wiping the venv mid-upgrade would race the in-flight
+                        // `uv pip install`; defer until it completes.
+                        if app.state::<daemon_update::DaemonUpdateStore>().updating() {
+                            log::info!("reset ignored: daemon upgrade in progress");
+                            return;
+                        }
                         // Stop the daemon first, otherwise removing the venv
                         // it depends on yields confusing errors in the logs.
                         let app_state = app.state::<AppState>();
@@ -269,6 +293,15 @@ pub fn run() {
             // it's `Running` and refreshes the account submenu labels.
             // Idles (slower cadence, no HTTP) when the daemon is down.
             hf_auth::start_status_poller(app_handle.clone());
+
+            // ---- Daemon update poller ----
+            //
+            // Long-lived thread that periodically compares the installed
+            // `reachy-mini` version (read from `.venv`) against the latest
+            // GitHub release, surfacing an "Update daemon" row in the tray
+            // menu when the install is behind. Fully fail-open (offline /
+            // rate-limited -> row simply stays hidden).
+            daemon_update::start_update_poller(app_handle.clone());
 
             // ---- USB device scanner ----
             //

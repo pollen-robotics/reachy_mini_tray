@@ -70,12 +70,29 @@ npm run dev
 
 The first launch opens a setup window, downloads `uv`, creates a Python 3.12 venv in `~/Library/Application Support/com.pollen-robotics.reachy-mini/.venv`, installs `reachy-mini`, then closes itself. From then on the app is tray-only.
 
-### Pinning a specific daemon version
+### Pinning the daemon version
 
-The `reachy-mini` Python package can be baked-in at build time via the sidecar script:
+The `reachy-mini` Python package is baked into the sidecar at build time. The
+shipped version is **pinned** in a single committed file,
+[`daemon-version.txt`](./daemon-version.txt), which is the source of truth for
+every default (`npm run build:sidecar`) and CI release build. Bump that file in
+a dedicated commit to move the whole app to a newer daemon:
+
+```
+# daemon-version.txt
+1.8.4
+```
+
+Because the pin is a concrete version string, the trampoline's spec-diff check
+(`needs_upgrade` in `uv-wrapper`) fires exactly once after the app updates and
+upgrades the venv in place - so each tray release ships a known-good, tested
+daemon version instead of whatever happened to be latest on PyPI at first run.
+
+For local dev and branch builds you can still override the pin without editing
+the file (overrides take precedence):
 
 ```bash
-# PyPI release pin
+# Override with a different PyPI version
 REACHY_MINI_VERSION=1.6.4 npm run build:sidecar
 
 # A development branch on pollen-robotics/reachy_mini
@@ -84,7 +101,11 @@ npm run build:sidecar:mobile-umbrella     # integration/mobile-app-daemon
 npm run build:sidecar:branch <any-branch>
 ```
 
-The marker `src-tauri/binaries/.reachy_mini_spec` records the chosen spec; running the script with a different spec will trigger an in-place venv upgrade on the next launch (or use `Reset setup…` from the tray for a clean reinstall).
+The marker `src-tauri/binaries/.reachy_mini_spec` records the resolved spec;
+building with a different spec triggers an in-place venv upgrade on the next
+launch (or use `Reset setup…` from the tray for a clean reinstall). Leaving
+`daemon-version.txt` empty falls back to "latest from PyPI" (non-deterministic,
+not recommended for releases).
 
 ## Daemon bootstrap smoke test
 
