@@ -48,6 +48,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libxdo-dev \
+            libudev-dev \
             libssl-dev \
             pkg-config
 

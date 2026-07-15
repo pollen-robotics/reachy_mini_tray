@@ -116,6 +116,7 @@ jobs:
             libcairo2-dev \
             libglib2.0-dev \
             libxdo-dev \
+            libudev-dev \
             libssl-dev \
             build-essential \
             pkg-config \
