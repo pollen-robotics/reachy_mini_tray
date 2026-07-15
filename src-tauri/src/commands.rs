@@ -47,16 +47,25 @@ pub(crate) fn show_logs_window(app: &AppHandle) -> tauri::Result<()> {
         return Ok(());
     }
 
-    WebviewWindowBuilder::new(app, LOGS_WINDOW_LABEL, WebviewUrl::App("logs.html".into()))
-        .title("Reachy Mini - Robot")
-        // The window hosts both the 3D viewer (left) and the logs pane (right);
-        // a wider default + larger minimum keeps both panes legible at boot.
-        .inner_size(1200.0, 640.0)
-        .min_inner_size(600.0, 320.0)
-        .resizable(true)
-        .center()
-        .visible(true)
-        .build()?;
+    let builder =
+        WebviewWindowBuilder::new(app, LOGS_WINDOW_LABEL, WebviewUrl::App("logs.html".into()))
+            .title("Reachy mini tray logs")
+            // The window hosts both the 3D viewer (left) and the logs pane (right);
+            // a wider default + larger minimum keeps both panes legible at boot.
+            .inner_size(1200.0, 640.0)
+            .min_inner_size(600.0, 320.0)
+            .resizable(true)
+            .center()
+            .visible(true);
+
+    // macOS: let the webview extend under the traffic lights and drop the
+    // native title text so the app can draw its own integrated top bar.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    builder.build()?;
     Ok(())
 }
 

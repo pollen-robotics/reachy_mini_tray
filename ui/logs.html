@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Reachy Mini - Logs</title>
+    <title>Reachy mini tray logs</title>
     <style>
       :root {
         color-scheme: dark light;
@@ -18,6 +18,8 @@
         --error: #ff6b6b;
         --debug: #7a808d;
         --trace: #5a606d;
+        /* The 3D viz always renders on white (see COLORS_LIGHT in viewer.js). */
+        --viz-bg: #ffffff;
       }
       @media (prefers-color-scheme: light) {
         :root {
@@ -31,6 +33,7 @@
           --error: #b91c1c;
           --debug: #6b7280;
           --trace: #9ca3af;
+          --viz-bg: #ffffff;
         }
       }
 
@@ -52,28 +55,95 @@
         min-height: 0;
       }
 
-      /* Generic per-pane header (used by both panes). */
-      .pane-header {
+      /* Logger toolbar (first row of the logs pane): level filters + actions.
+         Doubles as a window drag handle; controls opt out of dragging below. */
+      .logs-header {
         display: flex;
         align-items: center;
         gap: 8px;
-        padding: 6px 10px;
+        height: 44px;
+        min-height: 44px;
+        padding: 0 12px;
         background: var(--bg-elev);
         border-bottom: 1px solid var(--border);
         user-select: none;
         -webkit-app-region: drag;
-        min-height: 36px;
       }
 
-      .pane-header > * { -webkit-app-region: no-drag; }
-      .pane-header .spacer { flex: 1; }
+      .logs-header .spacer { flex: 1; }
 
-      /* Subtle vertical separator between header groups. */
-      .pane-header .sep {
-        width: 1px;
-        align-self: stretch;
-        background: var(--border);
-        margin: 4px 4px;
+      .logs-header button,
+      .logs-header input,
+      .logs-header .filters,
+      .logs-header .actions { -webkit-app-region: no-drag; }
+
+      /* Transparent drag strip over the top of the 3D view. Keeps the window
+         movable and lets the macOS traffic lights float over the viz, which
+         extends full-height underneath. */
+      .drag-strip {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 44px;
+        z-index: 4;
+        -webkit-app-region: drag;
+      }
+
+      /* Light grey MUI-style loading spinner, centered until the robot shows. */
+      .viewer-spinner {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 34px;
+        height: 34px;
+        margin: -17px 0 0 -17px;
+        z-index: 3;
+        pointer-events: none;
+        opacity: 1;
+        transition: opacity 0.3s ease;
+        color: var(--muted);
+      }
+
+      .mui-spinner {
+        width: 100%;
+        height: 100%;
+        animation: mui-spinner-rotate 1.4s linear infinite;
+      }
+
+      .mui-spinner-track {
+        stroke: color-mix(in srgb, currentColor 18%, transparent);
+      }
+
+      .mui-spinner-arc {
+        stroke: currentColor;
+        stroke-linecap: round;
+        stroke-dasharray: 80px, 200px;
+        stroke-dashoffset: 0;
+        animation: mui-spinner-dash 1.4s ease-in-out infinite;
+      }
+
+      .viewer-mount.viz-revealed .viewer-spinner {
+        opacity: 0;
+      }
+
+      @keyframes mui-spinner-rotate {
+        100% { transform: rotate(360deg); }
+      }
+
+      @keyframes mui-spinner-dash {
+        0% {
+          stroke-dasharray: 1px, 200px;
+          stroke-dashoffset: 0;
+        }
+        50% {
+          stroke-dasharray: 100px, 200px;
+          stroke-dashoffset: -15px;
+        }
+        100% {
+          stroke-dasharray: 100px, 200px;
+          stroke-dashoffset: -125px;
+        }
       }
 
       .status-pill {
@@ -118,22 +188,38 @@
         opacity: 0.8;
       }
 
+      /* Status pill overlaid on the 3D viewport, top-right. */
+      .status-pill.viewer-status-overlay {
+        position: absolute;
+        top: 8px;
+        right: 10px;
+        z-index: 5;
+        padding: 3px 8px;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--bg-elev) 82%, transparent);
+        border: 1px solid var(--border);
+        backdrop-filter: blur(4px);
+        -webkit-backdrop-filter: blur(4px);
+        pointer-events: none;
+      }
+
       /* Viewer pane: 3D viewer (left), default 30%. */
       .viewer-pane {
         flex: 0 0 30%;
         min-width: 240px;
-        background: var(--bg);
+        background: var(--viz-bg);
         display: flex;
         flex-direction: column;
         min-height: 0;
       }
 
-      .viewer-pane.hidden { display: none; }
-
       .viewer-mount {
         flex: 1;
         position: relative;
         min-height: 0;
+        /* Match the 3D scene clear color so the background stays identical
+           whether the spinner or the loaded robot is on screen. */
+        background: var(--viz-bg);
       }
 
       .viewer-mount canvas {
@@ -169,7 +255,6 @@
       .viewer-splitter.dragging { background: var(--border); }
       .viewer-splitter:hover::after,
       .viewer-splitter.dragging::after { opacity: 1; }
-      .viewer-pane.hidden + .viewer-splitter { display: none; }
 
       /* Logs pane: logs viewer (right), default 70%. */
       .logs-pane {
@@ -204,6 +289,95 @@
         background: var(--fg);
         color: var(--bg);
         border-color: var(--fg);
+      }
+
+      /* Second header row: search + per-source filters. */
+      .logs-subheader {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 5px 10px;
+        background: var(--bg-elev);
+        border-bottom: 1px solid var(--border);
+        min-height: 34px;
+      }
+
+      .logs-subheader .spacer { flex: 1; }
+
+      /* Line count + buffer cap, pinned to the right of the second bar. */
+      .logs-meta {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        flex: 0 0 auto;
+        font-size: 10.5px;
+        color: var(--muted);
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+        user-select: none;
+      }
+
+      .logs-meta .dim { opacity: 0.6; }
+
+      .search-box {
+        position: relative;
+        flex: 0 0 auto;
+        width: 220px;
+        display: flex;
+        align-items: center;
+      }
+
+      .search-box svg {
+        position: absolute;
+        left: 8px;
+        width: 13px;
+        height: 13px;
+        fill: var(--muted);
+        pointer-events: none;
+      }
+
+      .search-box input {
+        width: 100%;
+        padding: 4px 24px 4px 26px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--bg);
+        color: var(--fg);
+        font-family: inherit;
+        font-size: 12px;
+        outline: none;
+      }
+
+      .search-box input:focus {
+        border-color: var(--accent);
+      }
+
+      .search-box .clear-search {
+        position: absolute;
+        right: 6px;
+        width: 16px;
+        height: 16px;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        border: none;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        font-size: 14px;
+        line-height: 1;
+        padding: 0;
+        border-radius: 50%;
+      }
+      .search-box .clear-search:hover { color: var(--fg); }
+      .search-box.has-text .clear-search { display: inline-flex; }
+
+      /* Search match highlight inside messages. */
+      mark {
+        background: color-mix(in srgb, var(--warn) 45%, transparent);
+        color: inherit;
+        border-radius: 2px;
+        padding: 0 1px;
       }
 
       .actions {
@@ -243,45 +417,6 @@
         background: currentColor;
       }
 
-      /* Icon-only buttons for the 3D header (reset / wireframe / shot).
-         Sized like MUI <IconButton size="small" /> (28x28 with 18px icon). */
-      .icon-btn {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 28px;
-        height: 28px;
-        border-radius: 50%;
-        border: none;
-        background: transparent;
-        color: var(--muted);
-        cursor: pointer;
-        padding: 0;
-        transition: background 0.15s ease, color 0.15s ease;
-      }
-      .icon-btn:hover {
-        color: var(--fg);
-        background: color-mix(in srgb, var(--fg) 8%, transparent);
-      }
-      .icon-btn:focus-visible {
-        outline: 2px solid var(--accent);
-        outline-offset: 1px;
-      }
-      .icon-btn:disabled {
-        opacity: 0.35;
-        cursor: not-allowed;
-      }
-      .icon-btn.active {
-        color: var(--accent);
-        background: color-mix(in srgb, var(--accent) 14%, transparent);
-      }
-      .icon-btn svg {
-        width: 18px;
-        height: 18px;
-        display: block;
-        fill: currentColor;
-      }
-
       main {
         flex: 1;
         overflow-y: scroll;
@@ -289,27 +424,66 @@
         padding: 6px 0;
         font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
         font-size: 12px;
-        line-height: 1.55;
+        line-height: 1.5;
       }
 
+      /* Two-line compact meta column on the left (time on top, level + source
+         below), message on the right. The message is its own grid track, so
+         wrapped lines hang-indent under the message, never under the meta. */
       .row {
         display: grid;
-        grid-template-columns: 92px 50px 64px 1fr;
-        gap: 10px;
-        padding: 1px 12px;
-        white-space: pre-wrap;
-        word-break: break-word;
+        grid-template-columns: minmax(0, 92px) 1fr;
+        gap: 12px;
+        padding: 2px 12px;
+        border-left: 2px solid transparent;
+        cursor: pointer;
+        align-items: start;
       }
 
       .row:hover { background: var(--bg-elev); }
 
-      .row .ts { color: var(--muted); user-select: text; }
-      .row .lvl {
-        font-weight: 600;
+      /* Brief flash when a single line is copied via click. */
+      .row.flash {
+        background: color-mix(in srgb, var(--accent) 22%, transparent);
+        transition: background 0.45s ease;
+      }
+
+      /* A visible breath before a line that arrived after a long silence. */
+      .row.gap {
+        margin-top: 7px;
+        padding-top: 3px;
+        border-top: 1px dashed var(--border);
+      }
+
+      .row .meta {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        min-width: 0;
         font-size: 10.5px;
+        line-height: 1.3;
+      }
+
+      .row .ts {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.01em;
+        user-select: text;
+      }
+
+      .row .meta-sub {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        min-width: 0;
+      }
+
+      .row .lvl {
+        font-weight: 700;
+        font-size: 9px;
         text-transform: uppercase;
         letter-spacing: 0.05em;
-        align-self: center;
+        flex-shrink: 0;
       }
       .row.lvl-INFO  .lvl { color: var(--info); }
       .row.lvl-WARN  .lvl { color: var(--warn); }
@@ -317,10 +491,15 @@
       .row.lvl-DEBUG .lvl { color: var(--debug); }
       .row.lvl-TRACE .lvl { color: var(--trace); }
 
+      .row.lvl-INFO  { border-left-color: color-mix(in srgb, var(--info) 55%, transparent); }
+      .row.lvl-WARN  { border-left-color: var(--warn); }
+      .row.lvl-ERROR { border-left-color: var(--error); }
+      .row.lvl-DEBUG { border-left-color: color-mix(in srgb, var(--debug) 45%, transparent); }
+      .row.lvl-TRACE { border-left-color: color-mix(in srgb, var(--trace) 45%, transparent); }
+
       .row .tgt {
         color: var(--muted);
-        font-size: 11px;
-        align-self: center;
+        font-size: 10px;
         text-overflow: ellipsis;
         overflow: hidden;
         white-space: nowrap;
@@ -328,7 +507,12 @@
       }
       .row.tgt-daemon .tgt { color: var(--accent); opacity: 1; }
 
-      .row .msg { color: var(--fg); }
+      .row .msg {
+        color: var(--fg);
+        min-width: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
       .row.lvl-WARN  .msg { color: var(--warn); }
       .row.lvl-ERROR .msg { color: var(--error); }
 
@@ -339,7 +523,6 @@
         font-style: italic;
       }
 
-      footer,
       .pane-footer {
         padding: 4px 12px;
         font-size: 10.5px;
@@ -355,86 +538,72 @@
         align-items: center;
       }
 
-      .pane-footer .left,
-      .pane-footer .right {
+      .pane-footer .left {
         display: inline-flex;
         align-items: center;
         gap: 8px;
         min-width: 0;
       }
 
-      .pane-footer .right {
-        max-width: 60%;
-      }
-
-      .pane-footer code {
-        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-        font-size: 10.5px;
-        color: var(--fg);
-        opacity: 0.85;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-
       .pane-footer .dim {
         opacity: 0.55;
+      }
+
+      /* Stats bar overlaid on the bottom of the 3D viewport. */
+      .pane-footer.viewer-footer-overlay {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: transparent;
+        border-top: none;
+        pointer-events: none;
+        padding: 8px 10px;
+      }
+
+      .viewer-footer-overlay .left {
+        padding: 3px 8px;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--bg-elev) 82%, transparent);
+        border: 1px solid var(--border);
+        backdrop-filter: blur(4px);
+        -webkit-backdrop-filter: blur(4px);
       }
     </style>
   </head>
   <body>
     <div id="root">
       <section class="viewer-pane" id="viewerPane" aria-label="3D robot viewer">
-        <div class="pane-header">
-          <button id="viewerReset" class="icon-btn" type="button" title="Reset camera" aria-label="Reset camera">
-            <!-- MUI: center_focus_strong -->
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 8c-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4-1.79-4-4-4zM3 5v4h2V5h4V3H5c-1.1 0-2 .9-2 2zm2 10H3v4c0 1.1.9 2 2 2h4v-2H5v-4zm14 4h-4v2h4c1.1 0 2-.9 2-2v-4h-2v4zm0-16h-4v2h4v4h2V5c0-1.1-.9-2-2-2z" />
+        <div class="viewer-mount" id="viewerMount">
+          <!-- Transparent strip so the frameless window can be dragged and the
+               macOS traffic lights sit over the 3D view. -->
+          <div class="drag-strip" data-tauri-drag-region></div>
+          <div class="viewer-spinner" id="viewerSpinner" aria-hidden="true">
+            <svg class="mui-spinner" viewBox="22 22 44 44">
+              <circle class="mui-spinner-track" cx="44" cy="44" r="20.2" fill="none" stroke-width="3.2" />
+              <circle class="mui-spinner-arc" cx="44" cy="44" r="20.2" fill="none" stroke-width="3.2" />
             </svg>
-          </button>
-          <button id="viewerWire" class="icon-btn" type="button" title="Toggle wireframe" aria-label="Toggle wireframe" aria-pressed="false">
-            <!-- MUI: grid_view -->
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M3 3v8h8V3H3zm6 6H5V5h4v4zm-6 4v8h8v-8H3zm6 6H5v-4h4v4zm4-16v8h8V3h-8zm6 6h-4V5h4v4zm-6 4v8h8v-8h-8zm6 6h-4v-4h4v4z" />
-            </svg>
-          </button>
-          <button id="viewerShot" class="icon-btn" type="button" title="Save screenshot (PNG)" aria-label="Save screenshot">
-            <!-- MUI: camera_alt (body + lens cutout) -->
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path fill-rule="evenodd" clip-rule="evenodd" d="M20 4h-3.17L15 2H9L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 13c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z" />
-            </svg>
-          </button>
-          <span class="spacer"></span>
-          <span class="status-pill s-connecting" id="viewerStatus">
+          </div>
+          <span class="status-pill s-connecting viewer-status-overlay" id="viewerStatus">
             <span class="label">connecting</span>
           </span>
-        </div>
-        <div class="viewer-mount" id="viewerMount"></div>
-        <div class="pane-footer" id="viewerFooter">
-          <div class="left">
-            <span id="viewerFps" class="dim">- fps</span>
-            <span class="dim">·</span>
-            <span id="viewerHz" class="dim">- Hz</span>
-            <span class="dim">·</span>
-            <span id="viewerAge" class="dim">-</span>
-          </div>
-          <div class="right">
-            <code id="viewerPeer" class="dim" title="">no peer</code>
+          <div class="pane-footer viewer-footer-overlay" id="viewerFooter">
+            <div class="left">
+              <span id="viewerFps" class="dim">- fps</span>
+            </div>
           </div>
         </div>
       </section>
       <div class="viewer-splitter" id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize viewer"></div>
       <section class="logs-pane">
-        <div class="pane-header">
-          <div class="actions">
-            <button id="toggleViewer" class="toggle on" type="button" title="Show/hide 3D viewer">3D</button>
-          </div>
-          <span class="sep" aria-hidden="true"></span>
+        <div class="logs-header">
           <div class="filters" id="filters">
             <button class="pill active" data-level="ALL">All</button>
             <button class="pill" data-level="INFO">Info</button>
             <button class="pill" data-level="WARN">Warn</button>
             <button class="pill" data-level="ERROR">Error</button>
+            <button class="pill" data-level="DEBUG">Debug</button>
+            <button class="pill" data-level="TRACE">Trace</button>
           </div>
           <span class="spacer"></span>
           <div class="actions">
@@ -443,13 +612,22 @@
             <button id="clear" type="button">Clear</button>
           </div>
         </div>
+        <div class="logs-subheader">
+          <label class="search-box" id="searchBox">
+            <!-- MUI: search -->
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"/></svg>
+            <input id="search" type="text" placeholder="Filter messages…" autocomplete="off" spellcheck="false" aria-label="Filter log messages" />
+            <button type="button" class="clear-search" id="clearSearch" title="Clear" aria-label="Clear search">&times;</button>
+          </label>
+          <span class="spacer"></span>
+          <div class="logs-meta">
+            <span id="count">0 lines</span>
+            <span class="dim">buffer: 500 lines max</span>
+          </div>
+        </div>
         <main id="main">
           <div class="empty" id="empty">Waiting for logs&hellip;</div>
         </main>
-        <footer>
-          <span id="count">0 lines</span>
-          <span>buffer: 500 lines max</span>
-        </footer>
       </section>
     </div>
 
@@ -464,28 +642,37 @@
       const followBtn = document.getElementById("toggleFollow");
       const copyBtn = document.getElementById("copyAll");
       const clearBtn = document.getElementById("clear");
+      const searchBox = document.getElementById("searchBox");
+      const searchInput = document.getElementById("search");
+      const clearSearchBtn = document.getElementById("clearSearch");
 
       const MAX_LINES = 500;
-      let activeLevel = "ALL";
+      // Empty sets mean "no restriction" (show everything for that facet).
+      const activeLevels = new Set();
+      let searchText = "";
       let follow = true;
-      const buffer = [];
+      let lastTs = null; // ts_ms of the previous rendered entry (for delta)
+      const GAP_MS = 1000; // gap threshold to flag a "silence" before a line
 
-      function levelMatches(entry) {
-        return activeLevel === "ALL" || entry.level === activeLevel;
+      // Stable pastel colour per source label so a glance tells them apart.
+      function sourceColor(name) {
+        if (name === "daemon") return "var(--accent)";
+        let h = 0;
+        for (let i = 0; i < name.length; i++) {
+          h = (h * 31 + name.charCodeAt(i)) >>> 0;
+        }
+        const hue = h % 360;
+        return `hsl(${hue} 60% 62%)`;
       }
 
-      function fmtTs(ts_ms) {
-        const d = new Date(ts_ms);
-        const pad = (n) => n.toString().padStart(2, "0");
-        return (
-          pad(d.getHours()) +
-          ":" +
-          pad(d.getMinutes()) +
-          ":" +
-          pad(d.getSeconds()) +
-          "." +
-          d.getMilliseconds().toString().padStart(3, "0")
-        );
+      function rowMatches(row) {
+        if (activeLevels.size && !activeLevels.has(row.dataset.level))
+          return false;
+        if (searchText) {
+          const hay = (row.dataset.search || "").toLowerCase();
+          if (!hay.includes(searchText)) return false;
+        }
+        return true;
       }
 
       function shortTarget(target) {
@@ -496,14 +683,68 @@
         return target.split("::")[0];
       }
 
+      const pad2 = (n) => n.toString().padStart(2, "0");
+
+      // Wall-clock "HH:MM:SS" (shown dim) — sub-second precision lives in the
+      // relative delta instead, keeping the time cell compact.
+      function fmtClock(ts_ms) {
+        const d = new Date(ts_ms);
+        return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+      }
+
+      // Full timestamp with milliseconds, used for tooltips and copy.
+      function fmtFull(ts_ms) {
+        const d = new Date(ts_ms);
+        return (
+          fmtClock(ts_ms) + "." + d.getMilliseconds().toString().padStart(3, "0")
+        );
+      }
+
+      // Rebuild a message node, wrapping search hits in <mark>.
+      function renderMessage(msgEl, text) {
+        msgEl.textContent = "";
+        if (!searchText) {
+          msgEl.textContent = text;
+          return;
+        }
+        const lower = text.toLowerCase();
+        let i = 0;
+        let idx;
+        while ((idx = lower.indexOf(searchText, i)) !== -1) {
+          if (idx > i) msgEl.appendChild(document.createTextNode(text.slice(i, idx)));
+          const mark = document.createElement("mark");
+          mark.textContent = text.slice(idx, idx + searchText.length);
+          msgEl.appendChild(mark);
+          i = idx + searchText.length;
+        }
+        if (i < text.length) msgEl.appendChild(document.createTextNode(text.slice(i)));
+      }
+
       function rowEl(entry) {
         const row = document.createElement("div");
         const tgt = shortTarget(entry.target);
         row.className = "row lvl-" + entry.level + " tgt-" + tgt;
         row.dataset.level = entry.level;
+        row.dataset.tgt = tgt;
+        row.dataset.msg = entry.message;
+        row.dataset.ts = fmtFull(entry.ts_ms);
+        row.dataset.search = (entry.message || "") + " " + tgt + " " + entry.level;
+
+        const delta = lastTs == null ? null : entry.ts_ms - lastTs;
+        if (delta != null && delta >= GAP_MS) row.classList.add("gap");
+        lastTs = entry.ts_ms;
+
+        // Compact two-line meta: HH:MM:SS on top, level + source below.
+        const metaEl = document.createElement("div");
+        metaEl.className = "meta";
+        metaEl.title = row.dataset.ts; // full ms timestamp on hover
+
         const tsEl = document.createElement("span");
         tsEl.className = "ts";
-        tsEl.textContent = fmtTs(entry.ts_ms);
+        tsEl.textContent = fmtClock(entry.ts_ms);
+
+        const subEl = document.createElement("span");
+        subEl.className = "meta-sub";
         const lvlEl = document.createElement("span");
         lvlEl.className = "lvl";
         lvlEl.textContent = entry.level;
@@ -511,44 +752,115 @@
         tgtEl.className = "tgt";
         tgtEl.textContent = tgt;
         tgtEl.title = entry.target || "";
+        if (tgt !== "daemon") tgtEl.style.color = sourceColor(tgt);
+        subEl.append(lvlEl, tgtEl);
+        metaEl.append(tsEl, subEl);
+
         const msgEl = document.createElement("span");
         msgEl.className = "msg";
-        msgEl.textContent = entry.message;
-        row.append(tsEl, lvlEl, tgtEl, msgEl);
+        renderMessage(msgEl, entry.message);
+
+        row.append(metaEl, msgEl);
         return row;
+      }
+
+      function updateCount() {
+        const total = main.querySelectorAll(".row").length;
+        const shown = main.querySelectorAll(".row:not([data-hidden])").length;
+        countEl.textContent =
+          shown === total ? `${total} lines` : `${shown} / ${total} lines`;
       }
 
       function renderEntry(entry) {
         if (emptyEl.parentNode === main) emptyEl.remove();
         const row = rowEl(entry);
-        if (!levelMatches(entry)) row.style.display = "none";
+        if (!rowMatches(row)) {
+          row.style.display = "none";
+          row.dataset.hidden = "1";
+        }
         main.appendChild(row);
         // Trim DOM to MAX_LINES so we don't grow unbounded.
         while (main.children.length > MAX_LINES) {
           main.firstChild.remove();
         }
         if (follow) main.scrollTop = main.scrollHeight;
-        countEl.textContent = main.children.length + " lines";
+        updateCount();
       }
 
       function applyFilter() {
         for (const row of main.children) {
-          if (row === emptyEl) continue;
-          row.style.display =
-            activeLevel === "ALL" || row.dataset.level === activeLevel
-              ? ""
-              : "none";
+          if (!row.classList.contains("row")) continue;
+          const ok = rowMatches(row);
+          row.style.display = ok ? "" : "none";
+          if (ok) delete row.dataset.hidden;
+          else row.dataset.hidden = "1";
+          if (ok) renderMessage(row.querySelector(".msg"), row.dataset.msg);
         }
+        updateCount();
         if (follow) main.scrollTop = main.scrollHeight;
       }
 
+      // Level pills: "All" clears the level set; specific pills toggle and
+      // combine (multi-select). With no specific level active, "All" lights up.
       filtersEl.addEventListener("click", (e) => {
         const btn = e.target.closest(".pill");
         if (!btn) return;
-        for (const p of filtersEl.querySelectorAll(".pill"))
-          p.classList.toggle("active", p === btn);
-        activeLevel = btn.dataset.level;
+        const lvl = btn.dataset.level;
+        if (lvl === "ALL") {
+          activeLevels.clear();
+        } else if (activeLevels.has(lvl)) {
+          activeLevels.delete(lvl);
+        } else {
+          activeLevels.add(lvl);
+        }
+        syncLevelPills();
         applyFilter();
+      });
+
+      function syncLevelPills() {
+        for (const p of filtersEl.querySelectorAll(".pill")) {
+          if (p.dataset.level === "ALL")
+            p.classList.toggle("active", activeLevels.size === 0);
+          else p.classList.toggle("active", activeLevels.has(p.dataset.level));
+        }
+      }
+
+      // Live text search over message + source + level.
+      let searchDebounce = null;
+      searchInput.addEventListener("input", () => {
+        searchText = searchInput.value.trim().toLowerCase();
+        searchBox.classList.toggle("has-text", searchInput.value.length > 0);
+        clearTimeout(searchDebounce);
+        searchDebounce = setTimeout(applyFilter, 80);
+      });
+
+      clearSearchBtn.addEventListener("click", () => {
+        searchInput.value = "";
+        searchText = "";
+        searchBox.classList.remove("has-text");
+        applyFilter();
+        searchInput.focus();
+      });
+
+      // Click a line to copy just that line (without clobbering selection).
+      main.addEventListener("click", async (e) => {
+        const row = e.target.closest(".row");
+        if (!row) return;
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed) return; // user is selecting text
+        const text =
+          row.dataset.ts +
+          " [" +
+          row.dataset.level +
+          "] [" +
+          row.dataset.tgt +
+          "] " +
+          row.dataset.msg;
+        try {
+          await navigator.clipboard.writeText(text);
+          row.classList.add("flash");
+          setTimeout(() => row.classList.remove("flash"), 450);
+        } catch {}
       });
 
       followBtn.addEventListener("click", () => {
@@ -575,13 +887,13 @@
           .filter((row) => row.style.display !== "none")
           .map(
             (row) =>
-              row.querySelector(".ts").textContent +
+              row.dataset.ts +
               " [" +
-              row.querySelector(".lvl").textContent +
+              row.dataset.level +
               "] [" +
-              row.querySelector(".tgt").textContent +
+              row.dataset.tgt +
               "] " +
-              row.querySelector(".msg").textContent,
+              row.dataset.msg,
           )
           .join("\n");
         try {
@@ -598,6 +910,7 @@
         await invoke("clear_logs");
         main.innerHTML = "";
         main.appendChild(emptyEl);
+        lastTs = null;
         countEl.textContent = "0 lines";
       });
 
@@ -618,16 +931,13 @@
     <script type="module">
       // ─── 3D viewer wiring ────────────────────────────────────────────
       // The viewer module is loaded lazily so a broken esm.sh fetch
-      // never blocks the logs UI. Toggle, splitter and wireframe state
-      // are persisted in localStorage so the user's choice survives
-      // window reopen.
+      // never blocks the logs UI. The splitter width is persisted in
+      // localStorage so the user's choice survives window reopen.
 
       // The `.v2` suffix on `size` invalidates pre-30/70-default values
       // saved by earlier builds so users get the new layout out of the box.
       const STORAGE = {
-        visible:   "reachyTray.viewer.visible",
-        size:      "reachyTray.viewer.sizePx.v2",
-        wireframe: "reachyTray.viewer.wireframe",
+        size: "reachyTray.viewer.sizePx.v2",
       };
 
       const rootEl     = document.getElementById("root");
@@ -635,34 +945,13 @@
       const mountEl    = document.getElementById("viewerMount");
       const statusEl   = document.getElementById("viewerStatus");
       const splitterEl = document.getElementById("splitter");
-      const toggleBtn  = document.getElementById("toggleViewer");
-      const resetBtn   = document.getElementById("viewerReset");
-      const wireBtn    = document.getElementById("viewerWire");
-      const shotBtn    = document.getElementById("viewerShot");
       const fpsEl      = document.getElementById("viewerFps");
-      const hzEl       = document.getElementById("viewerHz");
-      const ageEl      = document.getElementById("viewerAge");
-      const peerEl     = document.getElementById("viewerPeer");
 
       // Restore persisted width (% of root) or fall back to CSS default (30%).
       const savedSize = parseFloat(localStorage.getItem(STORAGE.size) || "");
       if (Number.isFinite(savedSize) && savedSize > 10 && savedSize < 90) {
         paneEl.style.flex = `0 0 ${savedSize}%`;
       }
-
-      // Restore persisted visibility (default: visible).
-      let viewerVisible = localStorage.getItem(STORAGE.visible) !== "0";
-      function applyViewerVisibility() {
-        paneEl.classList.toggle("hidden", !viewerVisible);
-        toggleBtn.classList.toggle("on", viewerVisible);
-        viewerInstance?.setVisible(viewerVisible);
-      }
-
-      toggleBtn.addEventListener("click", () => {
-        viewerVisible = !viewerVisible;
-        localStorage.setItem(STORAGE.visible, viewerVisible ? "1" : "0");
-        applyViewerVisibility();
-      });
 
       // Drag-to-resize splitter. Width is stored as a % of the root
       // container so it scales with window resize.
@@ -691,7 +980,7 @@
 
       // ─── status pill + stats helpers ─────────────────────────────────
       function setStatusPill(state, meta) {
-        statusEl.className = "status-pill s-" + state;
+        statusEl.className = "status-pill viewer-status-overlay s-" + state;
         const label = document.createElement("span");
         label.className = "label";
         label.textContent = state;
@@ -704,65 +993,14 @@
         }
       }
 
-      function fmtAge(ms) {
-        if (!Number.isFinite(ms)) return "-";
-        if (ms < 1000) return `${Math.round(ms)} ms`;
-        return `${(ms / 1000).toFixed(1)} s`;
-      }
-
-      let lastStatus = "connecting";
       function onStats(stats) {
         fpsEl.textContent = `${stats.fps} fps`;
         fpsEl.classList.toggle("dim", stats.fps < 5);
-        hzEl.textContent  = `${stats.wsHz} Hz`;
-        hzEl.classList.toggle("dim", stats.wsHz === 0);
-        ageEl.textContent = fmtAge(stats.lastAgeMs);
-        ageEl.classList.toggle("dim", !Number.isFinite(stats.lastAgeMs));
-
-        // Surface the live Hz next to the status dot.
-        if (lastStatus === "live") {
-          setStatusPill("live", `${stats.wsHz} Hz`);
-        }
-
-        if (stats.peerId || stats.robotName) {
-          const name = stats.robotName || "robot";
-          const short = stats.peerId ? stats.peerId.slice(0, 8) : "";
-          peerEl.textContent = short ? `${name} · ${short}` : name;
-          peerEl.title = stats.peerId ? `${name}\npeer ${stats.peerId}` : name;
-          peerEl.classList.remove("dim");
-        }
       }
 
       function onStatusChange(s) {
-        lastStatus = s;
         setStatusPill(s);
       }
-
-      // ─── viewer actions (header icon buttons) ────────────────────────
-      resetBtn.addEventListener("click", () => {
-        viewerInstance?.resetCamera();
-      });
-
-      let wireOn = localStorage.getItem(STORAGE.wireframe) === "1";
-      function applyWireUi() {
-        wireBtn.classList.toggle("active", wireOn);
-        wireBtn.setAttribute("aria-pressed", wireOn ? "true" : "false");
-      }
-      applyWireUi();
-
-      wireBtn.addEventListener("click", () => {
-        if (!viewerInstance) return;
-        wireOn = viewerInstance.toggleWireframe();
-        localStorage.setItem(STORAGE.wireframe, wireOn ? "1" : "0");
-        applyWireUi();
-      });
-
-      shotBtn.addEventListener("click", () => {
-        if (!viewerInstance) return;
-        viewerInstance.screenshot();
-        shotBtn.classList.add("active");
-        setTimeout(() => shotBtn.classList.remove("active"), 350);
-      });
 
       // ─── lazy module load ────────────────────────────────────────────
       // Errors are caught and surfaced as "unavailable" so the logs
@@ -775,17 +1013,11 @@
           onStatusChange,
           onStats,
         });
-        // Re-apply persisted wireframe state.
-        if (wireOn) {
-          viewerInstance.toggleWireframe();
-        }
       } catch (err) {
         console.warn("[viewer3d] init failed", err);
         setStatusPill("error", "unavailable");
-        resetBtn.disabled = wireBtn.disabled = shotBtn.disabled = true;
+        mountEl.classList.add("viz-revealed");
       }
-
-      applyViewerVisibility();
 
       window.addEventListener("beforeunload", () => {
         try { viewerInstance?.dispose(); } catch {}
