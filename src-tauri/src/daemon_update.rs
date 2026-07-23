@@ -91,7 +91,10 @@ fn parse_semver(value: &str) -> Option<SemVer> {
     let major = parts.next()?.parse::<u32>().ok()?;
     let minor = parts.next()?.parse::<u32>().ok()?;
     let patch_field = parts.next()?;
-    let patch_digits: String = patch_field.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let patch_digits: String = patch_field
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     let patch = patch_digits.parse::<u32>().ok()?;
     Some((major, minor, patch))
 }
@@ -481,10 +484,15 @@ fn run_upgrade(app: &AppHandle, target: SemVer) -> Result<(), String> {
 fn upgrade_venv(app: &AppHandle, data_dir: &Path, venv: &str, spec: &str) -> Result<(), String> {
     let uv = paths::uv_exe_path().ok_or("uv executable path unavailable")?;
     if !uv.exists() {
-        return Err(format!("uv not found at {} (run setup first)", uv.display()));
+        return Err(format!(
+            "uv not found at {} (run setup first)",
+            uv.display()
+        ));
     }
     let python = paths::venv_python_for(venv).ok_or("venv python path unavailable")?;
-    let python_str = python.to_str().ok_or("venv python path is not valid UTF-8")?;
+    let python_str = python
+        .to_str()
+        .ok_or("venv python path is not valid UTF-8")?;
 
     let output = Command::new(&uv)
         .current_dir(data_dir)

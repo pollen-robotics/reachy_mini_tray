@@ -111,7 +111,15 @@ pub(crate) fn refresh_status(app: &AppHandle) {
         .map(|s| s.snapshot())
         .unwrap_or_default();
     let devices = current_usb_devices(&app_state);
-    match build_tray_menu(app, state, mode, serialport.as_deref(), &devices, &snap, &update) {
+    match build_tray_menu(
+        app,
+        state,
+        mode,
+        serialport.as_deref(),
+        &devices,
+        &snap,
+        &update,
+    ) {
         Ok(menu) => {
             if let Err(e) = tray.set_menu(Some(menu)) {
                 log::warn!("set_menu failed: {}", e);
@@ -375,13 +383,8 @@ pub(crate) fn build_tray_menu(
     let sep_footer = PredefinedMenuItem::separator(app)?;
     let sep_quit = PredefinedMenuItem::separator(app)?;
 
-    let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = vec![
-        &status_row,
-        &sep_status,
-        &toggle,
-        &sep_top,
-        &target_submenu,
-    ];
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =
+        vec![&status_row, &sep_status, &toggle, &sep_top, &target_submenu];
 
     match &account {
         AccountSlot::Flat(item) => {
