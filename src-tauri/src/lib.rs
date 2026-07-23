@@ -122,7 +122,9 @@ pub fn run() {
             // right before spawning, but that only helps if the user
             // clicks Start - an orphan can live indefinitely between
             // tray relaunches otherwise. Sweeping here closes that gap.
-            #[cfg(unix)]
+            // Cross-platform: on Windows the orphan is reparented but still
+            // holds `:8000` / `:8443` and the COM port, so the same sweep
+            // applies (port + module-name based instead of process-group).
             daemon::reap_orphaned_daemons();
 
             // ---- Initial tray menu ----

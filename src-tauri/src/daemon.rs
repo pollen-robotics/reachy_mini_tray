@@ -561,13 +561,30 @@ pub(crate) fn kill_daemon(state: &AppState) {
         // `:8000` / `:8443`. Reaping by port catches exactly that case.
         reap_orphaned_daemons();
     }
+
+    // Windows has no process groups or POSIX signals we can lean on, and the
+    // trampoline's Windows path is a bare `child.wait()` with no watchdog: the
+    // `child.kill()` above (TerminateProcess) only takes down the trampoline
+    // itself, leaving the Python daemon it spawned orphaned and still bound to
+    // `:8000` / `:8443` and the serial (COM) port. Sweep by listening port +
+    // daemon module name to bring the whole subtree down, mirroring the
+    // desktop app's cross-platform cleanup.
+    #[cfg(windows)]
+    reap_orphaned_daemons();
 }
 
 /// Ports the daemon listens on. `:8000` is the HTTP API, `:8443` the
 /// GStreamer WebRTC signaling server. A zombie daemon holds *both*, so we
 /// sweep both to be sure we don't leave a half-dead process around.
-#[cfg(unix)]
 const DAEMON_LISTEN_PORTS: [&str; 2] = ["8000", "8443"];
+
+/// Daemon module entry point. Used on Windows to match the orphaned Python
+/// process by its command line, as a belt-and-braces on top of the port
+/// sweep (catches a daemon that died after forking but before binding, or
+/// one that only holds the serial port). Mirrors the desktop app's
+/// `DAEMON_PROCESS_PATTERN`.
+#[cfg(windows)]
+const DAEMON_PROCESS_PATTERN: &str = "reachy_mini.daemon.app.main";
 
 /// Find any process currently bound to one of [`DAEMON_LISTEN_PORTS`] and
 /// kill it with SIGKILL. Called in several places:
@@ -606,10 +623,7 @@ pub(crate) fn reap_orphaned_daemons() {
     lsof_args.push("-sTCP:LISTEN".to_string());
     lsof_args.push("-t".to_string());
 
-    let output = match std::process::Command::new("lsof")
-        .args(&lsof_args)
-        .output()
-    {
+    let output = match std::process::Command::new("lsof").args(&lsof_args).output() {
         Ok(o) => o,
         Err(e) => {
             log::debug!("lsof not available, skipping zombie sweep: {}", e);
@@ -674,6 +688,111 @@ pub(crate) fn reap_orphaned_daemons() {
     std::thread::sleep(Duration::from_millis(200));
 }
 
+/// Windows counterpart to the Unix zombie sweep above. Same purpose (kill any
+/// orphaned daemon holding `:8000` / `:8443` / the serial port so the next
+/// `Start` doesn't fail with `address already in use`), but Windows has no
+/// process groups or POSIX signals, so we shell out to built-in tools:
+///
+/// 1. `netstat -ano` maps each daemon listening port to its owning PID;
+/// 2. `taskkill /F /T /PID <pid>` force-kills that PID **and its whole child
+///    tree** (`/T`), so killing either the trampoline or the Python child
+///    takes the other down too;
+/// 3. belt-and-braces: `wmic` finds any Python process whose command line
+///    still mentions the daemon module and `taskkill`s it, catching a daemon
+///    that hadn't bound a port yet.
+///
+/// All three tools ship with Windows, so this adds no dependency and needs no
+/// `libc`. Mirrors `cleanup_system_daemons()` in the desktop app.
+#[cfg(windows)]
+pub(crate) fn reap_orphaned_daemons() {
+    use std::process::Command;
+
+    let own_pid = std::process::id().to_string();
+
+    // ---- 1 + 2: sweep by listening port ----
+    let mut pids: Vec<String> = Vec::new();
+    match Command::new("netstat").arg("-ano").output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if !line.contains("LISTENING") {
+                    continue;
+                }
+                let on_daemon_port = DAEMON_LISTEN_PORTS
+                    .iter()
+                    .any(|p| line.contains(&format!(":{}", p)));
+                if !on_daemon_port {
+                    continue;
+                }
+                // The PID is the last whitespace-separated column.
+                if let Some(pid) = line.split_whitespace().last() {
+                    if pid != "0" && pid != own_pid && !pids.iter().any(|p| p == pid) {
+                        pids.push(pid.to_string());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            log::debug!(
+                "netstat not available, skipping port-based zombie sweep: {}",
+                e
+            );
+        }
+    }
+
+    if !pids.is_empty() {
+        log::warn!(
+            "found {} orphan process(es) on TCP/{:?}, killing: {:?}",
+            pids.len(),
+            DAEMON_LISTEN_PORTS,
+            pids
+        );
+        for pid in &pids {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", pid.as_str()])
+                .output();
+        }
+    }
+
+    // ---- 3: belt-and-braces sweep by command line ----
+    if let Ok(out) = Command::new("wmic")
+        .args([
+            "process",
+            "where",
+            &format!("CommandLine like '%{}%'", DAEMON_PROCESS_PATTERN),
+            "get",
+            "ProcessId",
+        ])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Skip the `ProcessId` header line.
+        for line in stdout.lines().skip(1) {
+            let pid = line.trim();
+            if !pid.is_empty()
+                && pid != own_pid
+                && pid.chars().all(|c| c.is_ascii_digit())
+                && !pids.iter().any(|p| p == pid)
+            {
+                log::warn!("killing orphan Python daemon by module name (pid={})", pid);
+                let _ = Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", pid])
+                    .output();
+            }
+        }
+    }
+
+    // Give the OS a moment to release the listening sockets before the caller
+    // tries to rebind. Same rationale as the Unix path.
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+/// Fallback for exotic targets that are neither `unix` nor `windows`. We
+/// never ship there, but keeping a no-op lets the ungated call sites compile
+/// everywhere without extra `cfg` noise.
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn reap_orphaned_daemons() {}
+
 /// `killpg(pgid, sig)` wrapper that defends against the most embarrassing
 /// failure mode: pgid == 0 ("our own process group"), which would kill the
 /// tray app itself. Returns silently on any error.
@@ -691,10 +810,7 @@ fn kill_process_group(pgid: i32, sig: i32) {
     // SAFETY: getpgrp(2) is a libc syscall.
     let own_pgid = unsafe { libc::getpgrp() };
     if pgid == own_pgid {
-        log::warn!(
-            "refusing killpg on the tray's own process group ({})",
-            pgid
-        );
+        log::warn!("refusing killpg on the tray's own process group ({})", pgid);
         return;
     }
     // SAFETY: killpg(2) is a libc syscall, no Rust invariants to uphold.
@@ -760,8 +876,8 @@ pub(crate) fn start_daemon(app: &AppHandle) {
     // Pre-flight: kill any pre-existing daemon left over from a crash or a
     // previous version of the tray that didn't use process-group cleanup.
     // Without this, our just-spawned Python would die with `address already
-    // in use` on port 8000 ~8 s after the user clicks Start.
-    #[cfg(unix)]
+    // in use` on port 8000 ~8 s after the user clicks Start. Cross-platform:
+    // process-group + port sweep on Unix, port + module-name sweep on Windows.
     reap_orphaned_daemons();
 
     set_daemon_state(&app_state, DaemonState::Starting);
