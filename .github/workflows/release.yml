@@ -21,13 +21,28 @@ on:
         type: string
         default: 'develop'
 
-# This workflow mirrors `release-unified.yml` from reachy_mini_desktop_app
-# but is significantly slimmer because the tray app:
-#   - has no auto-updater wired up yet (no Tauri signing key required)
-#   - has no Apple notarization / Windows signing secrets configured yet
-# Both can be added incrementally later by introducing the corresponding
-# `Setup ... signing` steps. For now we ship unsigned bundles and skip
-# `latest.json` / GitHub Pages plumbing.
+# Build + sign + release via the official `tauri-apps/tauri-action`.
+#
+# Why tauri-action (vs the hand-rolled workflow the desktop app uses): the
+# desktop app forces a manual pipeline because it drives Apple keychain import
+# + notarization + a bespoke `latest.json` merge in a specific order. The tray
+# does NOT have that constraint - it bakes no Python into the bundle (the venv
+# is created at first-run on the user's machine), so the only pre-build step is
+# compiling the `uv-trampoline` sidecar. That happens as a normal step BEFORE
+# tauri-action, and `externalBin` picks it up from disk. tauri-action then does
+# build -> sign -> (notarize) -> create release -> generate & upload latest.json
+# in one step (`uploadUpdaterJson: true`, merged across the matrix).
+#
+# Signing status (see docs/known-edge-cases.md):
+#   - Updater artifacts: always signed with the minisign key
+#     `TAURI_SIGNING_PRIVATE_KEY` (repo secret, no password).
+#   - macOS bundle: real Developer ID + notarization when the APPLE_* secrets
+#     are present (planned once the repo moves under `pollen`); until then a
+#     `signingIdentity: "-"` ad-hoc fallback keeps auto-update working (the
+#     updater can relaunch the swapped app; only the first manual install needs
+#     right-click > Open).
+#   - Windows bundle: currently unsigned (SmartScreen warning on first install);
+#     Authenticode to be wired at the pollen migration.
 
 jobs:
   build-and-release:
@@ -189,55 +204,69 @@ jobs:
           }
           Write-Host "✅ Sidecar built: $sidecar"
 
-      - name: Build Tauri app
+      - name: macOS ad-hoc signing fallback
+        # Until real Developer ID secrets exist, ad-hoc sign the bundle so it is
+        # self-consistent on Apple Silicon: this avoids the " is damaged" hard
+        # block and lets the updater relaunch the freshly swapped app. When
+        # APPLE_SIGNING_IDENTITY is configured we skip this and let tauri-action
+        # do proper signing + notarization instead.
+        if: startsWith(matrix.os, 'macos')
         shell: bash
         working-directory: reachy_mini_tray
         env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "✅ Apple Developer ID configured -> real signing + notarization via tauri-action"
+            exit 0
+          fi
+          echo "⚠️  No APPLE_SIGNING_IDENTITY secret -> falling back to ad-hoc signing (signingIdentity '-')."
+          echo "    Auto-update will work; the first manual install still needs right-click > Open."
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("src-tauri/tauri.conf.json")
+          conf = json.loads(p.read_text())
+          conf.setdefault("bundle", {}).setdefault("macOS", {})["signingIdentity"] = "-"
+          p.write_text(json.dumps(conf, indent=2) + "\n")
+          print("Injected bundle.macOS.signingIdentity = '-'")
+          PY
+
+      - name: Build, sign and release (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # AppImage tools rely on FUSE which isn't available on the runner;
           # APPIMAGE_EXTRACT_AND_RUN tells them to self-extract instead.
           APPIMAGE_EXTRACT_AND_RUN: 1
-        run: npx tauri build --target ${{ matrix.target }}
-
-      - name: Stage release artifacts
-        id: stage
-        shell: bash
-        working-directory: reachy_mini_tray
-        run: |
-          STAGE="$GITHUB_WORKSPACE/release-stage/${{ matrix.platform }}"
-          mkdir -p "$STAGE"
-          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
-
-          echo "📦 Bundle directory: $BUNDLE_DIR"
-          if [ -d "$BUNDLE_DIR" ]; then
-            find "$BUNDLE_DIR" -maxdepth 3 -type f \
-              \( -name "*.dmg" -o -name "*.app.tar.gz" \
-                 -o -name "*.msi" -o -name "*.exe" \
-                 -o -name "*.deb" -o -name "*.AppImage" \
-                 -o -name "*.AppImage.tar.gz" \) \
-              -exec cp -v {} "$STAGE/" \;
-          fi
-
-          echo "📦 Staged files for ${{ matrix.platform }}:"
-          ls -la "$STAGE" || true
-          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
-
-      - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+          # Updater artifact signing (minisign). The key has no password; the
+          # var must still be present (empty) so the signer runs non-interactively.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          # macOS Developer ID signing + notarization. All optional for now:
+          # when empty, tauri-action skips OS signing and the ad-hoc fallback
+          # above keeps macOS auto-update functional. Populate these at the
+          # pollen migration to get fully notarized, warning-free builds.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
-          name: bundle-${{ matrix.platform }}
-          path: ${{ steps.stage.outputs.stage }}/*
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload to GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: 'Reachy Mini Tray v${{ steps.version.outputs.version }}'
-          generate_release_notes: true
-          draft: false
+          projectPath: reachy_mini_tray
+          args: --target ${{ matrix.target }}
+          # Create/upload to the GitHub Release only on a real tag push that is
+          # not a dry run. Otherwise tagName is empty -> tauri-action just builds
+          # and uploads workflow artifacts (below), no release is touched.
+          tagName: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true') && github.ref_name || '' }}
+          releaseName: 'Reachy Mini Tray ${{ github.ref_name }}'
+          releaseDraft: false
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
-          files: ${{ steps.stage.outputs.stage }}/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          generateReleaseNotes: true
+          # Generate + upload latest.json (the updater endpoint), merged across
+          # all matrix platforms. Prefer the NSIS setup.exe for the Windows entry.
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          # Always mirror the bundles as workflow artifacts (handy for dry runs
+          # and for inspecting a build without cutting a release).
+          uploadWorkflowArtifacts: true

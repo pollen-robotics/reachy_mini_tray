@@ -127,8 +127,54 @@ user, so the owner matches in practice.
 
 ---
 
-## Out of scope for correctness (release hygiene)
+## OS code-signing (release hygiene)
 
-- **Unsigned installers:** Windows SmartScreen warning; macOS Gatekeeper
-  right-click-to-open. No code-signing / notarization configured yet.
-- **No auto-updater:** updates require reinstalling from the GitHub Release.
+The bundle updater's minisign signature is independent of OS code-signing and
+always works. OS signing only affects the **first manual install** experience
+and the ability to relaunch a swapped bundle. Current state:
+
+| Platform | Now (repo under `tfrere`) | Target (repo under `pollen`) |
+|----------|---------------------------|------------------------------|
+| macOS    | ad-hoc (`signingIdentity: "-"`), injected in CI when no `APPLE_SIGNING_IDENTITY` secret | Developer ID + notarization via the `APPLE_*` secrets |
+| Windows  | unsigned (SmartScreen warning on first install) | Authenticode (e.g. Azure Trusted Signing) |
+| Linux    | AppImage, no OS signing needed | unchanged |
+
+The pipeline is **already wired for full signing**: `release.yml` passes all the
+`APPLE_*` secrets to `tauri-action`. The day they are populated (planned at the
+pollen migration), macOS builds become fully notarized with **no workflow
+change** - the ad-hoc fallback step self-skips as soon as `APPLE_SIGNING_IDENTITY`
+is present.
+
+### Interim macOS ad-hoc caveat
+
+- Ad-hoc signed bundles are **not notarized**, so the first manual install still
+  triggers Gatekeeper (right-click > Open once). This does **not** affect
+  auto-update: once installed, the updater can verify (minisign), swap and
+  relaunch the ad-hoc bundle without a Gatekeeper prompt.
+- Ad-hoc identities are machine-agnostic, so a build signed on the runner opens
+  on any Mac (unlike a certificate tied to a keychain).
+
+## Self-update (Tauri bundle updater)
+
+The tray self-updates via `tauri-plugin-updater` (see `src/app_update.rs`):
+a startup check (release builds only) against
+`releases/latest/download/latest.json` opens a blocking overlay when a newer
+version is published. The CI builds, signs and publishes everything through
+`tauri-apps/tauri-action` (see `release.yml`): it signs the updater artifacts
+with `TAURI_SIGNING_PRIVATE_KEY` and assembles + uploads the merged `latest.json`
+in a single step (`uploadUpdaterJson: true`).
+
+Known edge cases:
+
+- **First updater-enabled release can't reach older installs:** builds shipped
+  before this feature have no updater, so users on those versions must
+  reinstall once from the GitHub Release. Every version from here on
+  self-updates. (Expected, one-time.)
+- **Signing key loss = broken updates:** if `TAURI_SIGNING_PRIVATE_KEY` (repo
+  secret) and its local backup (`~/.tauri/reachy_mini_tray.key`) are both
+  lost, the embedded `pubkey` no longer matches and updates fail to verify.
+  Recovery requires shipping a new pubkey via a manually-installed build.
+- **`releases/latest` skips pre-releases:** alpha/beta tags are marked
+  prerelease, so `releases/latest/download/latest.json` always resolves to the
+  newest *stable* release. Pre-release testers won't be offered pre-releases
+  through the updater (acceptable: they install those manually).
