@@ -204,24 +204,40 @@ jobs:
           }
           Write-Host "✅ Sidecar built: $sidecar"
 
-      - name: macOS ad-hoc signing fallback
-        # Until real Developer ID secrets exist, ad-hoc sign the bundle so it is
-        # self-consistent on Apple Silicon: this avoids the " is damaged" hard
-        # block and lets the updater relaunch the freshly swapped app. When
-        # APPLE_SIGNING_IDENTITY is configured we skip this and let tauri-action
-        # do proper signing + notarization instead.
+      - name: Configure macOS signing
+        # Decide macOS signing mode from the secrets and set it up accordingly.
+        # CRITICAL: Tauri's bundler treats a *present but empty* APPLE_CERTIFICATE
+        # as "import this cert" and runs `security import` with empty data, which
+        # fails ("SecKeychainItemImport: parameters were not valid"). So the
+        # APPLE_* vars must be left UNDEFINED (not empty) when we ad-hoc sign.
         if: startsWith(matrix.os, 'macos')
         shell: bash
         working-directory: reachy_mini_tray
         env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
-            echo "✅ Apple Developer ID configured -> real signing + notarization via tauri-action"
+            echo "✅ Apple Developer ID configured -> real signing + notarization."
+            # Promote the secrets to the job env so the tauri-action step (and
+            # Tauri's bundler) can import the cert + notarize.
+            {
+              echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+              echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+              echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
             exit 0
           fi
-          echo "⚠️  No APPLE_SIGNING_IDENTITY secret -> falling back to ad-hoc signing (signingIdentity '-')."
-          echo "    Auto-update will work; the first manual install still needs right-click > Open."
+          echo "⚠️  No APPLE_SIGNING_IDENTITY secret -> ad-hoc signing (signingIdentity '-')."
+          echo "    Auto-update works; the first manual install needs right-click > Open."
+          # Ad-hoc needs no certificate, so we do NOT export any APPLE_* here.
           python3 - <<'PY'
           import json, pathlib
           p = pathlib.Path("src-tauri/tauri.conf.json")
@@ -242,31 +258,41 @@ jobs:
           # var must still be present (empty) so the signer runs non-interactively.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
-          # macOS Developer ID signing + notarization. All optional for now:
-          # when empty, tauri-action skips OS signing and the ad-hoc fallback
-          # above keeps macOS auto-update functional. Populate these at the
-          # pollen migration to get fully notarized, warning-free builds.
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Apple signing/notarization vars are injected into $GITHUB_ENV by the
+          # "Configure macOS signing" step ONLY when the secrets exist, so they
+          # are absent (not empty) during ad-hoc builds.
         with:
           projectPath: reachy_mini_tray
           args: --target ${{ matrix.target }}
           # Create/upload to the GitHub Release only on a real tag push that is
-          # not a dry run. Otherwise tagName is empty -> tauri-action just builds
-          # and uploads workflow artifacts (below), no release is touched.
+          # not a dry run. Otherwise tagName is empty -> tauri-action only builds
+          # (no release touched); the inspection artifacts are uploaded below.
           tagName: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.event.inputs.dry_run != 'true') && github.ref_name || '' }}
-          releaseName: 'Reachy Mini Tray ${{ github.ref_name }}'
+          releaseName: 'Reachy Mini Tray v${{ steps.version.outputs.version }}'
           releaseDraft: false
           prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') }}
           generateReleaseNotes: true
-          # Generate + upload latest.json (the updater endpoint), merged across
-          # all matrix platforms. Prefer the NSIS setup.exe for the Windows entry.
-          uploadUpdaterJson: true
+          # Build + attach the updater manifest (latest.json), merged across the
+          # matrix, and prefer the NSIS setup.exe for the Windows entry. When a
+          # release is created (tag push) it is uploaded there automatically.
+          includeUpdaterJson: true
           updaterJsonPreferNsis: true
-          # Always mirror the bundles as workflow artifacts (handy for dry runs
-          # and for inspecting a build without cutting a release).
-          uploadWorkflowArtifacts: true
+
+      - name: Upload bundle artifacts (inspection)
+        # tauri-action has no built-in workflow-artifact upload, so mirror the
+        # produced bundles + updater signatures here. Handy for dry runs (verify
+        # the `.sig` files exist) and for grabbing a build without a release.
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: |
+            reachy_mini_tray/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.dmg
+            reachy_mini_tray/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app.tar.gz
+            reachy_mini_tray/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.msi
+            reachy_mini_tray/src-tauri/target/${{ matrix.target }}/release/bundle/**/*setup.exe
+            reachy_mini_tray/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.nsis.zip
+            reachy_mini_tray/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
+            reachy_mini_tray/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            reachy_mini_tray/src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
+          if-no-files-found: warn
+          retention-days: 14
