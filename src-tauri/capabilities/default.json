@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capability for the first-run window and the tray IPC",
-  "windows": ["first-run", "logs"],
+  "windows": ["first-run", "logs", "update"],
   "permissions": [
     "core:default",
     "core:event:allow-emit",

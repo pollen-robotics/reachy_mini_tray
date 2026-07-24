@@ -51,6 +51,11 @@ pub(crate) const ID_ACCOUNT_SIGNIN: &str = "account_signin";
 pub(crate) const ID_ACCOUNT_SIGNOUT: &str = "account_signout";
 pub(crate) const ID_ACCOUNT_REFRESH_RELAY: &str = "account_refresh_relay";
 pub(crate) const ID_SHOW_LOGS: &str = "show_logs";
+/// Manual "Check for Updates…" for the tray app bundle itself (distinct
+/// from `ID_UPDATE_DAEMON`, which upgrades the Python daemon). Click
+/// triggers `app_update::check_now`, which opens the update overlay if a
+/// newer release is available. Always present.
+pub(crate) const ID_UPDATE_APP: &str = "update_app";
 pub(crate) const ID_RESET_SETUP: &str = "reset_setup";
 /// Shown only when a newer daemon release is available (or an upgrade is in
 /// flight). Click triggers `daemon_update::start_update`.
@@ -325,6 +330,16 @@ pub(crate) fn build_tray_menu(
 
     // ---- Footer ----
     let show_logs = MenuItem::with_id(app, ID_SHOW_LOGS, "Show logs\u{2026}", true, None::<&str>)?;
+    // Manual self-update check. The startup auto-check already opens the
+    // overlay when a release is behind, but this lets an impatient user
+    // force a check on demand.
+    let update_app = MenuItem::with_id(
+        app,
+        ID_UPDATE_APP,
+        "Check for Updates\u{2026}",
+        true,
+        None::<&str>,
+    )?;
     // Reset setup wipes the daemon's data dir; doing it while the daemon
     // is `Starting` or `Running` would race against open file handles
     // (venv binaries currently exec'd, sqlite locks, serial port, etc.).
@@ -407,6 +422,7 @@ pub(crate) fn build_tray_menu(
 
     items.push(&sep_footer);
     items.push(&show_logs);
+    items.push(&update_app);
     items.push(&reset_setup);
     items.push(&sep_quit);
     items.push(&quit);

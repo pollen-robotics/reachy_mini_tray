@@ -17,6 +17,7 @@ use crate::logs::{LogEntry, LogStore};
 
 pub(crate) const FIRST_RUN_WINDOW_LABEL: &str = "first-run";
 pub(crate) const LOGS_WINDOW_LABEL: &str = "logs";
+pub(crate) const UPDATE_WINDOW_LABEL: &str = "update";
 
 pub(crate) fn show_first_run_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(existing) = app.get_webview_window(FIRST_RUN_WINDOW_LABEL) {
@@ -66,6 +67,57 @@ pub(crate) fn show_logs_window(app: &AppHandle) -> tauri::Result<()> {
         .hidden_title(true);
 
     builder.build()?;
+    Ok(())
+}
+
+/// Open (or focus) the blocking self-update overlay.
+///
+/// The overlay is a small, centered, always-on-top window that nags the
+/// user to install a newly published tray release. It is opened from the
+/// updater's async check task, so window creation is dispatched onto the
+/// main thread (Tauri requires webview windows to be built there on some
+/// platforms).
+pub(crate) fn show_update_window(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(existing) = app.get_webview_window(UPDATE_WINDOW_LABEL) {
+        existing.show()?;
+        existing.set_focus()?;
+        return Ok(());
+    }
+
+    let app = app.clone();
+    let app_build = app.clone();
+    app.run_on_main_thread(move || {
+        // Re-check after hopping threads: a concurrent check could have
+        // created the window in the meantime.
+        if app_build.get_webview_window(UPDATE_WINDOW_LABEL).is_some() {
+            return;
+        }
+
+        let builder = WebviewWindowBuilder::new(
+            &app_build,
+            UPDATE_WINDOW_LABEL,
+            WebviewUrl::App("update.html".into()),
+        )
+        .title("Reachy Mini - Update")
+        .inner_size(460.0, 360.0)
+        .min_inner_size(460.0, 360.0)
+        .resizable(false)
+        .center()
+        .always_on_top(true)
+        .visible(true);
+
+        // macOS: draw under the traffic lights and hide the native title so
+        // the overlay reads as a single flat card, matching the other windows.
+        #[cfg(target_os = "macos")]
+        let builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true);
+
+        if let Err(e) = builder.build() {
+            log::warn!("failed to build update window: {}", e);
+        }
+    })?;
+
     Ok(())
 }
 

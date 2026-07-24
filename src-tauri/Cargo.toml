@@ -16,6 +16,12 @@ tauri-build = { version = "=2.5.6", features = [] }
 tauri                          = { version = "=2.10.3", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-shell             = "=2.3.5"
 tauri-plugin-single-instance   = "=2.4.1"
+# Self-update of the tray app itself (distinct from the daemon update in
+# `daemon_update.rs`). Fetches a signed `latest.json` from the GitHub Release,
+# verifies the minisign signature against the embedded pubkey, downloads and
+# installs the new bundle. The relaunch after install uses the built-in
+# `AppHandle::restart()`, so no extra process plugin is needed.
+tauri-plugin-updater           = "2"
 log                            = "=0.4.22"
 serde                          = { version = "=1.0.219", features = ["derive"] }
 serde_json                     = "=1.0.140"

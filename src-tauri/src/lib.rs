@@ -30,12 +30,13 @@
 //! - [`paths`]: data-dir layout (shared with `reachy_mini_desktop_app`).
 //! - [`usb`]: enumerate / filter Reachy Mini USB-serial devices.
 //!
-//! Explicitly out of scope: tray-app auto-update (the Tauri bundle updater),
-//! autostart-at-login, system sleep/wake reconciliation, Windows / Linux
-//! code-signing pipelines. Note that *daemon* (Python `reachy-mini`) updates
-//! ARE in scope - see [`daemon_update`].
+//! Explicitly out of scope: autostart-at-login, system sleep/wake
+//! reconciliation, Windows / Linux code-signing pipelines. Note that both
+//! *daemon* (Python `reachy-mini`) updates and *tray-app* (Tauri bundle)
+//! self-update ARE in scope - see [`daemon_update`] and [`app_update`].
 
 mod api;
+mod app_update;
 mod commands;
 mod daemon;
 mod daemon_update;
@@ -64,7 +65,7 @@ use crate::tray_icon::build_icon_cache;
 use crate::tray_menu::{
     build_tray_menu, refresh_status, ID_ACCOUNT_REFRESH_RELAY, ID_ACCOUNT_SIGNIN,
     ID_ACCOUNT_SIGNOUT, ID_ACCOUNT_SUBMENU, ID_QUIT, ID_RESET_SETUP, ID_SHOW_LOGS, ID_TARGET_SIM,
-    ID_TARGET_USB_PREFIX, ID_TOGGLE, ID_UPDATE_DAEMON, TRAY_ID,
+    ID_TARGET_USB_PREFIX, ID_TOGGLE, ID_UPDATE_APP, ID_UPDATE_DAEMON, TRAY_ID,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -88,14 +89,21 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_shell::init())
+        // Self-update of the tray bundle (see `app_update`). Registering the
+        // plugin wires the Rust `app.updater()` API against the endpoint +
+        // pubkey configured in `tauri.conf.json`.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new())
         .manage(LogStore::new())
         .manage(hf_auth::AuthStatusStore::new())
         .manage(daemon_update::DaemonUpdateStore::new())
+        .manage(app_update::AppUpdateStore::new())
         .invoke_handler(tauri::generate_handler![
             commands::close_first_run_window,
             commands::get_logs,
-            commands::clear_logs
+            commands::clear_logs,
+            app_update::get_app_update_info,
+            app_update::install_app_update
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -250,6 +258,12 @@ pub fn run() {
                             log::warn!("failed to show logs window: {}", e);
                         }
                     }
+                    ID_UPDATE_APP => {
+                        // Manual self-update check: opens the overlay if a
+                        // newer tray release is available, otherwise logs
+                        // "already latest".
+                        app_update::check_now(app);
+                    }
                     ID_RESET_SETUP => {
                         // Wiping the venv mid-upgrade would race the in-flight
                         // `uv pip install`; defer until it completes.
@@ -304,6 +318,17 @@ pub fn run() {
             // menu when the install is behind. Fully fail-open (offline /
             // rate-limited -> row simply stays hidden).
             daemon_update::start_update_poller(app_handle.clone());
+
+            // ---- Tray self-update check ----
+            //
+            // One-shot check against the GitHub-release `latest.json`. If a
+            // newer tray bundle is published, opens the blocking update
+            // overlay. Gated to release builds: a `cargo run` / `tauri dev`
+            // binary can't be replaced in place by the updater, so checking
+            // in dev would only ever surface a non-installable prompt. Use
+            // the "Check for Updates…" menu item for on-demand checks.
+            #[cfg(not(debug_assertions))]
+            app_update::start_update_check(app_handle.clone());
 
             // ---- USB device scanner ----
             //
