@@ -112,6 +112,10 @@ pub fn run() {
             // log records also feed the in-app logs window.
             logs::bind_app_handle(&app_handle);
 
+            // Surface the running bundle version so it is visible in the logs
+            // window - handy to confirm which build is live after a self-update.
+            log::info!("[tray] starting Reachy Mini tray v{}", env!("CARGO_PKG_VERSION"));
+
             // Pre-flight orphan sweep.
             //
             // If the previous tray died without passing through
