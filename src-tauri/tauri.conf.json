@@ -40,7 +40,7 @@
     "updater": {
       "active": true,
       "endpoints": [
-        "https://github.com/tfrere/reachy_mini_tray/releases/latest/download/latest.json"
+        "https://github.com/pollen-robotics/reachy_mini_tray/releases/latest/download/latest.json"
       ],
       "dialog": false,
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY0QTEwRkE1QjNCNzE4REEKUldUYUdMZXpwUStoOUtTcmV5SGdqTXVuMHZJMWRIVklYb2FoMlVBWW1ERGh4N2dqQ1hING1RdFYK",
