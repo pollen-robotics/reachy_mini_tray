@@ -1,6 +1,6 @@
 [package]
 name = "reachy_mini_tray"
-version = "0.1.0"
+version = "0.1.1"
 description = "Reachy Mini Daemon tray launcher"
 authors = ["Reachy Mini Contributors"]
 edition = "2021"
