@@ -169,11 +169,13 @@ pub async fn install_app_update(app: AppHandle) -> Result<(), String> {
             move |chunk_len, content_len| {
                 downloaded += chunk_len as u64;
                 let percent = content_len.map(|total| {
-                    if total == 0 {
-                        0
-                    } else {
-                        ((downloaded.saturating_mul(100)) / total).min(100) as u8
-                    }
+                    // `checked_div` (vs a manual `if total == 0`) keeps clippy's
+                    // `manual_checked_ops` lint happy; a zero content-length is
+                    // unknown progress, so fall back to 0%.
+                    downloaded
+                        .saturating_mul(100)
+                        .checked_div(total)
+                        .map_or(0, |p| p.min(100) as u8)
                 });
                 let _ = app_progress.emit(
                     EVENT_PROGRESS,
