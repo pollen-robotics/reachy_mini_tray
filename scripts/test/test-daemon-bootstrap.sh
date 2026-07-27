@@ -123,7 +123,6 @@ DAEMON_ARGS=(
     --mockup-sim
     --no-wake-up-on-start
     --no-media
-    --localhost-only
     --robot-name reachy_mini_tray_smoke
     --log-level INFO
 )
