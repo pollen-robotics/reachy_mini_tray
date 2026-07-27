@@ -152,15 +152,18 @@ cleanup() {
         fi
     fi
 
+    # Dump the log BEFORE removing the temp dir: LOG_FILE lives inside
+    # TEST_HOME, so wiping it first (as we used to) left `tail` with nothing
+    # to read - which is why every CI failure so far was undiagnosable.
+    if [[ $exit_code -ne 0 ]]; then
+        fail "Smoke test failed (exit=$exit_code). Last 60 lines of daemon log:"
+        tail -n 60 "$LOG_FILE" 2>/dev/null | sed 's/^/    /' >&2 || true
+    fi
+
     if [[ -z "${KEEP_DATA_DIR:-}" ]]; then
         rm -rf "$TEST_HOME"
     else
         warn "KEEP_DATA_DIR=1, leaving $TEST_HOME on disk"
-    fi
-
-    if [[ $exit_code -ne 0 ]]; then
-        fail "Smoke test failed (exit=$exit_code). Last 60 lines of daemon log:"
-        tail -n 60 "$LOG_FILE" 2>/dev/null | sed 's/^/    /' >&2 || true
     fi
     exit $exit_code
 }

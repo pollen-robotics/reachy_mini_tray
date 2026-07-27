@@ -189,11 +189,19 @@ try {
 
     Step 'Smoke test passed'
 } finally {
-    & $cleanup $proc $TestRoot $LogFile $env:KEEP_DATA_DIR
+    # Dump the logs BEFORE cleanup removes the temp dir: $LogFile (and its
+    # .err sibling) live inside $TestRoot, so removing it first left
+    # Get-Content with nothing to read - which is why CI failures here were
+    # undiagnosable. stderr is redirected to "$LogFile.err", so surface both.
     if (-not $ready) {
-        FailMsg 'Last 60 lines of daemon log:'
+        FailMsg 'Last 60 lines of daemon stdout:'
         Get-Content -Tail 60 $LogFile -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+        if (Test-Path "$LogFile.err") {
+            FailMsg 'Last 60 lines of daemon stderr:'
+            Get-Content -Tail 60 "$LogFile.err" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+        }
     }
+    & $cleanup $proc $TestRoot $LogFile $env:KEEP_DATA_DIR
 }
 
 if (-not $ready) { exit 1 }
