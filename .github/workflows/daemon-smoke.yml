@@ -75,12 +75,20 @@ jobs:
           workspaces: reachy_mini_desktop_app/uv-wrapper -> target
           shared-key: smoke-${{ matrix.target }}
 
-      - name: Install Linux daemon runtime dependencies
+      - name: Install Linux daemon runtime + build dependencies
         if: matrix.os == 'ubuntu-24.04'
-        # The Python daemon imports portaudio + GStreamer at startup even
-        # under `--no-media`, but it won't open any device. Install the
-        # shared libraries so `import` doesn't raise; we don't need any
-        # audio/video plugins beyond `-base`.
+        # Two groups of deps:
+        #
+        # 1. Runtime: the Python daemon imports portaudio + GStreamer at
+        #    startup even under `--no-media`, though it opens no device.
+        #    The shared libs just keep `import` from raising.
+        # 2. Build: reachy-mini pulls `pygobject` (and `pycairo`), which have
+        #    no manylinux wheel for this pin, so uv compiles them from sdist
+        #    via meson. That build needs the cairo / glib / gobject-
+        #    introspection *-dev* headers + pkg-config, otherwise it fails
+        #    with `Dependency "cairo" not found` and the whole
+        #    `uv pip install reachy-mini` aborts. (macOS/Windows get wheels,
+        #    so this only bites the Linux matrix leg.)
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -88,6 +96,11 @@ jobs:
             libasound2-dev \
             libgstreamer1.0-0 \
             libgstreamer-plugins-base1.0-0 \
+            libcairo2-dev \
+            libgirepository1.0-dev \
+            gobject-introspection \
+            libglib2.0-dev \
+            pkg-config \
             curl
 
       - name: Run daemon bootstrap smoke test (Unix)
