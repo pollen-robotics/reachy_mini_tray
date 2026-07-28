@@ -24,6 +24,8 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 
 use crate::commands::show_update_window;
+use crate::daemon::kill_daemon;
+use crate::state::AppState;
 
 /// Emitted once when a newer version is found, so the overlay can populate
 /// its version labels even if it opens after the check completed.
@@ -197,6 +199,16 @@ pub async fn install_app_update(app: AppHandle) -> Result<(), String> {
         })?;
 
     log::info!("[app-update] install complete, relaunching");
+    // Kill the daemon before restarting. `app.restart()` re-execs the
+    // process directly and bypasses the `ExitRequested` cleanup path that
+    // normally runs `kill_daemon` on Quit, so without this the Python
+    // daemon would be orphaned across the restart - still holding `:8000`,
+    // the USB serial port and its central-relay registration until the new
+    // instance's boot-time `reap_orphaned_daemons()` sweep catches it.
+    // Killing it here makes the handover deterministic and closes that
+    // phantom-daemon window.
+    kill_daemon(&app.state::<AppState>());
+
     // `restart()` diverges (`-> !`): it re-execs the freshly installed
     // bundle and never returns, so nothing after this runs.
     app.restart();

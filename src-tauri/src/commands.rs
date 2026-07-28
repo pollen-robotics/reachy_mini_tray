@@ -98,9 +98,9 @@ pub(crate) fn show_update_window(app: &AppHandle) -> tauri::Result<()> {
             UPDATE_WINDOW_LABEL,
             WebviewUrl::App("update.html".into()),
         )
-        .title("Reachy Mini - Update")
-        .inner_size(460.0, 360.0)
-        .min_inner_size(460.0, 360.0)
+        .title("Reachy Mini Tray - Update")
+        .inner_size(460.0, 468.0)
+        .min_inner_size(460.0, 468.0)
         .resizable(false)
         .center()
         .always_on_top(true)

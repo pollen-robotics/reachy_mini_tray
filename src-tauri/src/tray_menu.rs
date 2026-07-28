@@ -61,6 +61,12 @@ pub(crate) const ID_RESET_SETUP: &str = "reset_setup";
 /// flight). Click triggers `daemon_update::start_update`.
 pub(crate) const ID_UPDATE_DAEMON: &str = "update_daemon";
 pub(crate) const ID_QUIT: &str = "quit";
+/// Always-disabled informational rows pinned to the very bottom of the
+/// menu: the running tray-bundle version and the installed daemon
+/// (`reachy-mini`) version. Purely a "what am I running" readout; clicks
+/// are no-ops, so no router entry is needed (mirrors `ID_STATUS`).
+pub(crate) const ID_VERSION_TRAY: &str = "version_tray";
+pub(crate) const ID_VERSION_DAEMON: &str = "version_daemon";
 
 /// Top-level entry point: re-render icon, tooltip and menu from the live
 /// `AppState` + `AuthStatusStore` snapshot. Cheap; safe to spam.
@@ -97,7 +103,7 @@ pub(crate) fn refresh_status(app: &AppHandle) {
     let serialport = current_serialport(&app_state);
     let target_label = compose_target_label(mode, serialport.as_deref());
     let tooltip = match state {
-        DaemonState::Idle => format!("Reachy Mini - Idle ({})", target_label),
+        DaemonState::Idle => format!("Reachy Mini - Not started ({})", target_label),
         DaemonState::Starting => format!("Reachy Mini - Starting ({})...", target_label),
         DaemonState::Running => format!("Reachy Mini - Running ({})", target_label),
         DaemonState::Crashed => format!("Reachy Mini - Crashed ({})", target_label),
@@ -353,6 +359,34 @@ pub(crate) fn build_tray_menu(
     )?;
     let quit = MenuItem::with_id(app, ID_QUIT, "Quit", true, None::<&str>)?;
 
+    // ---- Version footer (always disabled, very bottom) ----
+    //
+    // A quiet "what am I running" readout: the tray bundle version (baked
+    // at compile time) and the installed daemon version (read from the
+    // `.venv` dist-info by the update poller). Both greyed out - they are
+    // informational, never clickable.
+    let version_tray = MenuItem::with_id(
+        app,
+        ID_VERSION_TRAY,
+        format!("Tray v{}", env!("CARGO_PKG_VERSION")),
+        false,
+        None::<&str>,
+    )?;
+    let daemon_version_label = match update.installed {
+        Some(v) if update.installed_from_git => {
+            format!("Daemon v{} (dev)", daemon_update::fmt_version(v))
+        }
+        Some(v) => format!("Daemon v{}", daemon_update::fmt_version(v)),
+        None => "Daemon not installed".to_string(),
+    };
+    let version_daemon = MenuItem::with_id(
+        app,
+        ID_VERSION_DAEMON,
+        daemon_version_label,
+        false,
+        None::<&str>,
+    )?;
+
     // ---- Daemon update row ----
     //
     // Rendered only when the version poller (`daemon_update`) found a newer
@@ -397,6 +431,7 @@ pub(crate) fn build_tray_menu(
     let sep_update = PredefinedMenuItem::separator(app)?;
     let sep_footer = PredefinedMenuItem::separator(app)?;
     let sep_quit = PredefinedMenuItem::separator(app)?;
+    let sep_version = PredefinedMenuItem::separator(app)?;
 
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =
         vec![&status_row, &sep_status, &toggle, &sep_top, &target_submenu];
@@ -426,6 +461,9 @@ pub(crate) fn build_tray_menu(
     items.push(&reset_setup);
     items.push(&sep_quit);
     items.push(&quit);
+    items.push(&sep_version);
+    items.push(&version_tray);
+    items.push(&version_daemon);
 
     Menu::with_items(app, &items)
 }
@@ -440,7 +478,7 @@ pub(crate) fn build_tray_menu(
 /// that signal is otherwise easy to lose.
 fn build_status_row(app: &AppHandle, state: DaemonState) -> tauri::Result<IconMenuItem<Wry>> {
     let (text, icon) = match state {
-        DaemonState::Idle => ("Daemon is idle", NativeIcon::StatusNone),
+        DaemonState::Idle => ("Daemon not started", NativeIcon::StatusNone),
         DaemonState::Starting => (
             "Daemon is starting\u{2026}",
             NativeIcon::StatusPartiallyAvailable,

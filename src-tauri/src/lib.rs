@@ -108,6 +108,15 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
+            // macOS: run as a menu-bar *agent* - no Dock icon, no global
+            // app menu. The bundled Info.plist sets `LSUIElement`, but that
+            // only applies to the packaged `.app`; a `tauri dev` / `cargo
+            // run` binary would still bounce into the Dock. Setting the
+            // activation policy at runtime hides the Dock icon in every
+            // build (dev included) so behaviour is consistent.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             // Wire the global logger to the running app so subsequent
             // log records also feed the in-app logs window.
             logs::bind_app_handle(&app_handle);
@@ -176,136 +185,159 @@ pub fn run() {
                 .tooltip("Reachy Mini - Idle (USB)")
                 .menu(&menu)
                 .show_menu_on_left_click(true)
-                .on_menu_event(move |app, event| match event.id.as_ref() {
-                    ID_TOGGLE => {
-                        // A daemon upgrade stops/starts the daemon and mutates
-                        // the venv it runs from; a concurrent Start/Stop would
-                        // race the in-flight `uv pip install`. Ignore until the
-                        // upgrade thread clears the flag.
-                        if app.state::<daemon_update::DaemonUpdateStore>().updating() {
-                            log::info!("toggle ignored: daemon upgrade in progress");
+                .on_menu_event(move |app, event| {
+                    // Forced-update gate: while the self-update overlay is
+                    // open, freeze every tray command except Quit. Starting /
+                    // stopping the daemon, switching target, resetting the
+                    // venv or opening other windows underneath an in-flight
+                    // bundle swap only invites races, so we ignore them and
+                    // re-surface the overlay to make the gate obvious. Quit
+                    // stays live so the user is never trapped.
+                    if event.id.as_ref() != ID_QUIT {
+                        if let Some(win) = app.get_webview_window(commands::UPDATE_WINDOW_LABEL) {
+                            log::info!(
+                                "menu command '{}' ignored: update overlay is open",
+                                event.id.as_ref()
+                            );
+                            let _ = win.show();
+                            let _ = win.set_focus();
                             return;
                         }
-                        let app_state = app.state::<AppState>();
-                        match current_daemon_state(&app_state) {
-                            DaemonState::Idle | DaemonState::Crashed => start_daemon(app),
-                            DaemonState::Running => stop_daemon(app),
-                            // Disabled while Starting; defensive no-op.
-                            DaemonState::Starting => {}
+                    }
+                    match event.id.as_ref() {
+                        ID_TOGGLE => {
+                            // A daemon upgrade stops/starts the daemon and mutates
+                            // the venv it runs from; a concurrent Start/Stop would
+                            // race the in-flight `uv pip install`. Ignore until the
+                            // upgrade thread clears the flag.
+                            if app.state::<daemon_update::DaemonUpdateStore>().updating() {
+                                log::info!("toggle ignored: daemon upgrade in progress");
+                                return;
+                            }
+                            let app_state = app.state::<AppState>();
+                            match current_daemon_state(&app_state) {
+                                DaemonState::Idle | DaemonState::Crashed => start_daemon(app),
+                                DaemonState::Running => stop_daemon(app),
+                                // Disabled while Starting; defensive no-op.
+                                DaemonState::Starting => {}
+                            }
                         }
-                    }
-                    ID_UPDATE_DAEMON => {
-                        daemon_update::start_update(app);
-                    }
-                    ID_TARGET_SIM => {
-                        let app_state = app.state::<AppState>();
-                        if matches!(
-                            current_daemon_state(&app_state),
-                            DaemonState::Starting | DaemonState::Running
-                        ) {
-                            log::info!("ignored target change: daemon busy");
-                            return;
+                        ID_UPDATE_DAEMON => {
+                            daemon_update::start_update(app);
                         }
-                        if let Ok(mut guard) = app_state.mode.lock() {
-                            *guard = Mode::Simulation;
+                        ID_TARGET_SIM => {
+                            let app_state = app.state::<AppState>();
+                            if matches!(
+                                current_daemon_state(&app_state),
+                                DaemonState::Starting | DaemonState::Running
+                            ) {
+                                log::info!("ignored target change: daemon busy");
+                                return;
+                            }
+                            if let Ok(mut guard) = app_state.mode.lock() {
+                                *guard = Mode::Simulation;
+                            }
+                            // Drop any cached serialport: in sim mode we don't
+                            // want a stale path lingering in state, otherwise
+                            // a future menu refresh could mis-render the
+                            // selected device.
+                            set_serialport(&app_state, None);
+                            log::info!("target set to Simulation");
+                            refresh_status(app);
                         }
-                        // Drop any cached serialport: in sim mode we don't
-                        // want a stale path lingering in state, otherwise
-                        // a future menu refresh could mis-render the
-                        // selected device.
-                        set_serialport(&app_state, None);
-                        log::info!("target set to Simulation");
-                        refresh_status(app);
-                    }
-                    other if other.starts_with(ID_TARGET_USB_PREFIX) => {
-                        let app_state = app.state::<AppState>();
-                        if matches!(
-                            current_daemon_state(&app_state),
-                            DaemonState::Starting | DaemonState::Running
-                        ) {
-                            log::info!("ignored target change: daemon busy");
-                            return;
+                        other if other.starts_with(ID_TARGET_USB_PREFIX) => {
+                            let app_state = app.state::<AppState>();
+                            if matches!(
+                                current_daemon_state(&app_state),
+                                DaemonState::Starting | DaemonState::Running
+                            ) {
+                                log::info!("ignored target change: daemon busy");
+                                return;
+                            }
+                            // Resolve `target:usb:<index>` against the cached
+                            // device list. Indexes are stable for the lifetime
+                            // of a single menu render: the menu is rebuilt on
+                            // every refresh from the same `usb_devices` list,
+                            // so a click while the menu is open always lands
+                            // on the right device.
+                            let idx = other[ID_TARGET_USB_PREFIX.len()..].parse::<usize>().ok();
+                            let devices = current_usb_devices(&app_state);
+                            let Some(dev) = idx.and_then(|i| devices.get(i)).cloned() else {
+                                log::warn!(
+                                    "USB target id {} did not resolve to a known device",
+                                    other
+                                );
+                                return;
+                            };
+                            if let Ok(mut guard) = app_state.mode.lock() {
+                                *guard = Mode::Usb;
+                            }
+                            set_serialport(&app_state, Some(dev.serialport.clone()));
+                            log::info!("target set to USB ({})", dev.serialport);
+                            refresh_status(app);
                         }
-                        // Resolve `target:usb:<index>` against the cached
-                        // device list. Indexes are stable for the lifetime
-                        // of a single menu render: the menu is rebuilt on
-                        // every refresh from the same `usb_devices` list,
-                        // so a click while the menu is open always lands
-                        // on the right device.
-                        let idx = other[ID_TARGET_USB_PREFIX.len()..].parse::<usize>().ok();
-                        let devices = current_usb_devices(&app_state);
-                        let Some(dev) = idx.and_then(|i| devices.get(i)).cloned() else {
-                            log::warn!("USB target id {} did not resolve to a known device", other);
-                            return;
-                        };
-                        if let Ok(mut guard) = app_state.mode.lock() {
-                            *guard = Mode::Usb;
+                        ID_ACCOUNT_SIGNIN => {
+                            hf_auth::start_oauth_flow(app.clone());
                         }
-                        set_serialport(&app_state, Some(dev.serialport.clone()));
-                        log::info!("target set to USB ({})", dev.serialport);
-                        refresh_status(app);
-                    }
-                    ID_ACCOUNT_SIGNIN => {
-                        hf_auth::start_oauth_flow(app.clone());
-                    }
-                    ID_ACCOUNT_SIGNOUT => {
-                        hf_auth::sign_out(app);
-                    }
-                    ID_ACCOUNT_REFRESH_RELAY => {
-                        hf_auth::refresh_relay(app);
-                    }
-                    ID_ACCOUNT_SUBMENU => {
-                        // The "@user · remote on" item is a Submenu; macOS
-                        // routes its click to its children, but on some
-                        // platforms / older muda builds the submenu itself
-                        // can fire a hover event. Defensive no-op.
-                    }
-                    ID_SHOW_LOGS => {
-                        if let Err(e) = show_logs_window(app) {
-                            log::warn!("failed to show logs window: {}", e);
+                        ID_ACCOUNT_SIGNOUT => {
+                            hf_auth::sign_out(app);
                         }
-                    }
-                    ID_UPDATE_APP => {
-                        // Manual self-update check: opens the overlay if a
-                        // newer tray release is available, otherwise logs
-                        // "already latest".
-                        app_update::check_now(app);
-                    }
-                    ID_RESET_SETUP => {
-                        // Wiping the venv mid-upgrade would race the in-flight
-                        // `uv pip install`; defer until it completes.
-                        if app.state::<daemon_update::DaemonUpdateStore>().updating() {
-                            log::info!("reset ignored: daemon upgrade in progress");
-                            return;
+                        ID_ACCOUNT_REFRESH_RELAY => {
+                            hf_auth::refresh_relay(app);
                         }
-                        // Stop the daemon first, otherwise removing the venv
-                        // it depends on yields confusing errors in the logs.
-                        let app_state = app.state::<AppState>();
-                        kill_daemon(&app_state);
-                        set_daemon_state(&app_state, DaemonState::Idle);
-                        refresh_status(app);
-                        match paths::reset_bootstrap() {
-                            Ok(()) => log::info!("venv wiped; relaunching first-run setup"),
-                            Err(e) => log::warn!("failed to wipe venv: {}", e),
+                        ID_ACCOUNT_SUBMENU => {
+                            // The "@user · remote on" item is a Submenu; macOS
+                            // routes its click to its children, but on some
+                            // platforms / older muda builds the submenu itself
+                            // can fire a hover event. Defensive no-op.
                         }
-                        if let Err(e) = show_first_run_window(app) {
-                            log::warn!("failed to show first-run window: {}", e);
+                        ID_SHOW_LOGS => {
+                            if let Err(e) = show_logs_window(app) {
+                                log::warn!("failed to show logs window: {}", e);
+                            }
                         }
-                        // Kick the bootstrap immediately, same as the
-                        // first-launch path. Without this the venv stays
-                        // empty and the first-run window sits at 0% forever
-                        // until the user manually clicks Start daemon -
-                        // surprising UX for a "Reset" action.
-                        start_daemon(app);
+                        ID_UPDATE_APP => {
+                            // Manual self-update check: opens the overlay if a
+                            // newer tray release is available, otherwise logs
+                            // "already latest".
+                            app_update::check_now(app);
+                        }
+                        ID_RESET_SETUP => {
+                            // Wiping the venv mid-upgrade would race the in-flight
+                            // `uv pip install`; defer until it completes.
+                            if app.state::<daemon_update::DaemonUpdateStore>().updating() {
+                                log::info!("reset ignored: daemon upgrade in progress");
+                                return;
+                            }
+                            // Stop the daemon first, otherwise removing the venv
+                            // it depends on yields confusing errors in the logs.
+                            let app_state = app.state::<AppState>();
+                            kill_daemon(&app_state);
+                            set_daemon_state(&app_state, DaemonState::Idle);
+                            refresh_status(app);
+                            match paths::reset_bootstrap() {
+                                Ok(()) => log::info!("venv wiped; relaunching first-run setup"),
+                                Err(e) => log::warn!("failed to wipe venv: {}", e),
+                            }
+                            if let Err(e) = show_first_run_window(app) {
+                                log::warn!("failed to show first-run window: {}", e);
+                            }
+                            // Kick the bootstrap immediately, same as the
+                            // first-launch path. Without this the venv stays
+                            // empty and the first-run window sits at 0% forever
+                            // until the user manually clicks Start daemon -
+                            // surprising UX for a "Reset" action.
+                            start_daemon(app);
+                        }
+                        ID_QUIT => {
+                            log::info!("quit requested");
+                            QUIT_REQUESTED.store(true, Ordering::SeqCst);
+                            let app_state = app.state::<AppState>();
+                            kill_daemon(&app_state);
+                            app.exit(0);
+                        }
+                        other => log::warn!("unknown menu event: {}", other),
                     }
-                    ID_QUIT => {
-                        log::info!("quit requested");
-                        QUIT_REQUESTED.store(true, Ordering::SeqCst);
-                        let app_state = app.state::<AppState>();
-                        kill_daemon(&app_state);
-                        app.exit(0);
-                    }
-                    other => log::warn!("unknown menu event: {}", other),
                 })
                 .build(app)?;
 
