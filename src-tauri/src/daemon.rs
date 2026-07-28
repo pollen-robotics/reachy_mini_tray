@@ -24,6 +24,7 @@ use tauri_plugin_shell::ShellExt;
 use crate::api::{local_client, DAEMON_BASE_URL};
 use crate::commands::FIRST_RUN_WINDOW_LABEL;
 use crate::logs;
+use crate::paths;
 use crate::state::{
     current_daemon_state, current_generation, current_mode, current_serialport,
     current_usb_devices, next_generation, set_daemon_state, set_serialport, AppState, DaemonState,
@@ -51,6 +52,18 @@ const HEALTHCHECK_MAX_DURATION: Duration = Duration::from_secs(300);
 
 /// Per-request HTTP timeout used while polling `/daemon/status`.
 const HEALTHCHECK_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Origins probed by [`has_connectivity`] before a first-run bootstrap.
+/// These are exactly what the trampoline needs to download: the `uv` binary
+/// (GitHub) and the Python wheels (PyPI). We only declare the machine
+/// offline when BOTH fail, so a single host outage doesn't produce a false
+/// "no internet".
+const CONNECTIVITY_PROBES: [&str; 2] = ["https://pypi.org", "https://github.com"];
+
+/// Per-probe timeout for the first-run connectivity check. Short so an
+/// offline machine fails fast (a few seconds) instead of sitting through the
+/// 5-minute [`HEALTHCHECK_MAX_DURATION`] bootstrap timeout.
+const CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Minimum delay before we trust the first healthcheck success after a
 /// daemon spawn. Defends against an "eager-zombie" race: if a previous
@@ -829,6 +842,30 @@ fn kill_process_group(pgid: i32, sig: i32) {
 // HIGH-LEVEL START / STOP
 // ============================================================================
 
+/// Best-effort "is there any internet at all?" probe, used only before a
+/// first-run bootstrap. Returns `true` as soon as one probe host answers -
+/// any HTTP status counts, we only care that the TCP/TLS round-trip
+/// completed - and `false` only when every probe fails to connect.
+///
+/// Fail-open on client build errors: we would rather let the trampoline try
+/// (and surface the real download error itself) than block bootstrap on a
+/// false negative.
+fn has_connectivity() -> bool {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(CONNECTIVITY_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("connectivity check: client build failed ({e}); assuming online");
+            return true;
+        }
+    };
+    CONNECTIVITY_PROBES
+        .iter()
+        .any(|url| client.head(*url).send().is_ok())
+}
+
 pub(crate) fn start_daemon(app: &AppHandle) {
     let app_state = app.state::<AppState>();
     if matches!(
@@ -868,6 +905,37 @@ pub(crate) fn start_daemon(app: &AppHandle) {
             // USB on the next start without an explicit user pick.
             set_serialport(&app_state, None);
         }
+    }
+
+    // First-run fast-fail on no internet.
+    //
+    // A bootstrap (no venv yet) downloads `uv`, a Python runtime and the
+    // `reachy-mini` wheels from the network. Offline, all of that fails and
+    // the daemon never reaches `Running` - but the user would otherwise sit
+    // through the full 5-minute healthcheck timeout with only cryptic
+    // network errors scrolling by. Probe connectivity up-front and, if the
+    // machine is offline, surface a clear message in the first-run window
+    // and go straight to `Crashed` instead. Skipped once bootstrap is done:
+    // an already-provisioned venv starts locally (USB / sim) with no network
+    // dependency, so we must not block normal offline use.
+    if !paths::is_bootstrap_done() && !has_connectivity() {
+        log::warn!("first-run bootstrap aborted: no internet connectivity");
+        let progress = BootstrapProgress {
+            percent: None,
+            label: Some("No internet connection".to_string()),
+            line: Some(
+                "[bootstrap] No internet connection. Reachy Mini needs to be online for \
+                 first-time setup (it downloads a Python runtime and the reachy-mini \
+                 package). Connect to the internet, then click Start again."
+                    .to_string(),
+            ),
+        };
+        if let Err(e) = app.emit(EVENT_SETUP_PROGRESS, &progress) {
+            log::warn!("failed to emit offline setup notice: {}", e);
+        }
+        set_daemon_state(&app_state, DaemonState::Crashed);
+        refresh_status(app);
+        return;
     }
 
     let mode = current_mode(&app_state);
