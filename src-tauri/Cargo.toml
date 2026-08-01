@@ -29,6 +29,11 @@ tauri-plugin-updater           = "2"
 # Simulation downgrade when no robot is detected) to a user who isn't
 # looking at the menu.
 tauri-plugin-notification      = "2"
+# Native confirmation dialogs. Used to guard "Reset setup…", which wipes the
+# whole daemon data dir (venv + Python runtime) and costs a multi-minute
+# re-download: a one-click destructive action in a tray menu needs an "are
+# you sure?" - and the trailing "…" in the label already promises one.
+tauri-plugin-dialog            = "2"
 log                            = "=0.4.33"
 serde                          = { version = "=1.0.229", features = ["derive"] }
 serde_json                     = "=1.0.151"

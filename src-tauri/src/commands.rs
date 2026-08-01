@@ -39,8 +39,12 @@ fn present_window(app: &AppHandle, window: &tauri::WebviewWindow) {
 /// window remains open. The update overlay is intentionally excluded: it is
 /// `always_on_top` and shows fine under `Accessory`, so it must not keep the
 /// Dock icon alive.
+///
+/// `pub(crate)` so the "Reset setup…" confirmation dialog in `lib.rs` can
+/// demote after a cancel (it promotes to `Regular` before showing the
+/// dialog, for the same behind-everything reason as the windows here).
 #[cfg(target_os = "macos")]
-fn demote_if_no_user_windows(app: &AppHandle) {
+pub(crate) fn demote_if_no_user_windows(app: &AppHandle) {
     let has_user_window = app.get_webview_window(LOGS_WINDOW_LABEL).is_some()
         || app.get_webview_window(FIRST_RUN_WINDOW_LABEL).is_some();
     if !has_user_window {

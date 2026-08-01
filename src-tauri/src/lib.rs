@@ -99,6 +99,8 @@ pub fn run() {
         // Native OS notifications, used to surface tray-initiated decisions
         // that would otherwise be invisible (e.g. USB -> Simulation fallback).
         .plugin(tauri_plugin_notification::init())
+        // Native dialogs: confirmation gate in front of "Reset setup…".
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .manage(LogStore::new())
         .manage(hf_auth::AuthStatusStore::new())
@@ -332,27 +334,7 @@ pub fn run() {
                                 log::info!("reset ignored: daemon upgrade in progress");
                                 return;
                             }
-                            // Stop the daemon first, otherwise removing the venv
-                            // it depends on yields confusing errors in the logs.
-                            let app_state = app.state::<AppState>();
-                            kill_daemon(&app_state);
-                            set_daemon_state(&app_state, DaemonState::Idle);
-                            refresh_status(app);
-                            match paths::reset_bootstrap() {
-                                Ok(()) => log::info!("venv wiped; relaunching first-run setup"),
-                                Err(e) => log::warn!("failed to wipe venv: {}", e),
-                            }
-                            if let Err(e) = show_first_run_window(app) {
-                                log::warn!("failed to show first-run window: {}", e);
-                            }
-                            // Kick the bootstrap immediately, same as the
-                            // first-launch path. Without this the venv stays
-                            // empty and the first-run window sits at 0% forever
-                            // until the user manually clicks Start daemon -
-                            // surprising UX for a "Reset" action. Routed through
-                            // the update gate for uniformity; with the venv just
-                            // wiped it degenerates to a plain start.
-                            daemon_update::update_then_start(app);
+                            confirm_then_reset_setup(app);
                         }
                         ID_QUIT => {
                             log::info!("quit requested");
@@ -512,4 +494,86 @@ pub fn run() {
             }
             _ => {}
         });
+}
+
+/// Ask the user to confirm "Reset setup…" before doing anything.
+///
+/// The reset wipes the whole daemon data dir (venv + Python runtime) and
+/// costs a multi-minute re-download, sitting one row away from "Show
+/// logs…" in the menu - a misclick must not be destructive. The dialog is
+/// async (callback-based): the menu event thread returns immediately and
+/// the reset runs only if the user picks "Reset".
+fn confirm_then_reset_setup(app: &tauri::AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    // macOS: the tray runs as an `Accessory` agent, so a native alert would
+    // open unfocused behind the frontmost app - same issue as the webview
+    // windows, same fix (promote to `Regular` while the dialog is up, demote
+    // after; see `commands::present_window`). The menu event handler runs on
+    // the main thread, so calling this here is safe.
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
+    let app = app.clone();
+    app.clone()
+        .dialog()
+        .message(
+            "This deletes the daemon's Python environment and re-downloads \
+             everything from scratch (a few minutes on a fast connection).\n\n\
+             Your Hugging Face login and robot settings on the daemon side \
+             are not affected.",
+        )
+        .title("Reset Reachy Mini setup?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Reset".to_string(),
+            "Cancel".to_string(),
+        ))
+        .show(move |confirmed| {
+            // The dialog callback may run off the main thread; both the
+            // demote (AppKit) and the reset (opens a webview window) must
+            // run on it.
+            let app2 = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if confirmed {
+                    // The first-run window opened by the reset keeps the app
+                    // `Regular` and demotes on close via its own handler.
+                    perform_reset_setup(&app2);
+                } else {
+                    log::info!("reset setup cancelled by user");
+                    #[cfg(target_os = "macos")]
+                    commands::demote_if_no_user_windows(&app2);
+                }
+            });
+        });
+}
+
+/// The actual "Reset setup" body: stop the daemon, wipe the data dir,
+/// reopen the first-run window and kick a fresh bootstrap. Must run on the
+/// main thread (opens a webview window).
+fn perform_reset_setup(app: &tauri::AppHandle) {
+    // Re-check: an upgrade could have started while the dialog sat open.
+    if app.state::<daemon_update::DaemonUpdateStore>().updating() {
+        log::info!("reset aborted: daemon upgrade started while confirming");
+        return;
+    }
+    // Stop the daemon first, otherwise removing the venv it depends on
+    // yields confusing errors in the logs.
+    let app_state = app.state::<AppState>();
+    kill_daemon(&app_state);
+    set_daemon_state(&app_state, DaemonState::Idle);
+    refresh_status(app);
+    match paths::reset_bootstrap() {
+        Ok(()) => log::info!("venv wiped; relaunching first-run setup"),
+        Err(e) => log::warn!("failed to wipe venv: {}", e),
+    }
+    if let Err(e) = show_first_run_window(app) {
+        log::warn!("failed to show first-run window: {}", e);
+    }
+    // Kick the bootstrap immediately, same as the first-launch path.
+    // Without this the venv stays empty and the first-run window sits at
+    // 0% forever until the user manually clicks Start daemon - surprising
+    // UX for a "Reset" action. Routed through the update gate for
+    // uniformity; with the venv just wiped it degenerates to a plain start.
+    daemon_update::update_then_start(app);
 }

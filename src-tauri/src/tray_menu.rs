@@ -74,14 +74,29 @@ pub(crate) fn refresh_status(app: &AppHandle) {
         return;
     };
 
+    // The update snapshot is needed up-front: while an upgrade is running
+    // the FSM often reads `Idle` (the daemon is stopped so `uv pip install`
+    // can swap the venv), which would render a dead idle icon during a
+    // multi-minute install. The `updating` flag overrides icon, tooltip and
+    // status row so the user gets "something is happening" feedback at the
+    // exact place they last interacted with.
+    let update = app
+        .try_state::<daemon_update::DaemonUpdateStore>()
+        .map(|s| s.snapshot())
+        .unwrap_or_default();
+
     // ---- Icon ----
     let cache = app.state::<IconCache>();
-    let (icon, template) = match (state, mode) {
-        (DaemonState::Idle, _) => (cache.idle.clone(), true),
-        (DaemonState::Starting, _) => (cache.starting.clone(), false),
-        (DaemonState::Running, Mode::Usb) => (cache.running_usb.clone(), false),
-        (DaemonState::Running, Mode::Simulation) => (cache.running_sim.clone(), false),
-        (DaemonState::Crashed, _) => (cache.crashed.clone(), false),
+    let (icon, template) = if update.updating {
+        (cache.starting.clone(), false)
+    } else {
+        match (state, mode) {
+            (DaemonState::Idle, _) => (cache.idle.clone(), true),
+            (DaemonState::Starting, _) => (cache.starting.clone(), false),
+            (DaemonState::Running, Mode::Usb) => (cache.running_usb.clone(), false),
+            (DaemonState::Running, Mode::Simulation) => (cache.running_sim.clone(), false),
+            (DaemonState::Crashed, _) => (cache.crashed.clone(), false),
+        }
     };
     if let Err(e) = tray.set_icon(Some(icon)) {
         log::warn!("set_icon failed: {}", e);
@@ -97,11 +112,15 @@ pub(crate) fn refresh_status(app: &AppHandle) {
     // Mini is targeted without expanding the menu.
     let serialport = current_serialport(&app_state);
     let target_label = compose_target_label(mode, serialport.as_deref());
-    let tooltip = match state {
-        DaemonState::Idle => format!("Reachy Mini - Not started ({})", target_label),
-        DaemonState::Starting => format!("Reachy Mini - Starting ({})...", target_label),
-        DaemonState::Running => format!("Reachy Mini - Running ({})", target_label),
-        DaemonState::Crashed => format!("Reachy Mini - Crashed ({})", target_label),
+    let tooltip = if update.updating {
+        "Reachy Mini - Updating daemon\u{2026}".to_string()
+    } else {
+        match state {
+            DaemonState::Idle => format!("Reachy Mini - Not started ({})", target_label),
+            DaemonState::Starting => format!("Reachy Mini - Starting ({})...", target_label),
+            DaemonState::Running => format!("Reachy Mini - Running ({})", target_label),
+            DaemonState::Crashed => format!("Reachy Mini - Crashed ({})", target_label),
+        }
     };
     if let Err(e) = tray.set_tooltip(Some(&tooltip)) {
         log::warn!("set_tooltip failed: {}", e);
@@ -110,10 +129,6 @@ pub(crate) fn refresh_status(app: &AppHandle) {
     // ---- Menu ----
     let snap = app
         .try_state::<hf_auth::AuthStatusStore>()
-        .map(|s| s.snapshot())
-        .unwrap_or_default();
-    let update = app
-        .try_state::<daemon_update::DaemonUpdateStore>()
         .map(|s| s.snapshot())
         .unwrap_or_default();
     let devices = current_usb_devices(&app_state);
@@ -281,7 +296,7 @@ pub(crate) fn build_tray_menu(
     // colored native dot icon that matches the tray icon's tint. Lets
     // the user read the daemon's FSM state without having to map the
     // tray-icon tint to a meaning.
-    let status_row = build_status_row(app, state)?;
+    let status_row = build_status_row(app, state, update.updating)?;
 
     // ---- Toggle (Start / Stop / Restart) ----
     //
@@ -297,12 +312,16 @@ pub(crate) fn build_tray_menu(
     // the "press to start" play-button cue users expect from Docker
     // Desktop, Spotify, etc. The custom glyphs match SF Symbols'
     // `play.fill` / `stop.fill` weight and read clearly at 22 pt.
+    // While a daemon upgrade is running, Start / Stop / Restart would race
+    // the in-flight `uv pip install` (the click handler already ignores it;
+    // the disabled row makes that visible instead of a dead click).
+    let toggle_enabled = !update.updating;
     let toggle = match state {
         DaemonState::Idle => IconMenuItem::with_id(
             app,
             ID_TOGGLE,
             "Start daemon",
-            true,
+            toggle_enabled,
             Some(menu_icons::play_icon()),
             None::<&str>,
         )?,
@@ -310,7 +329,7 @@ pub(crate) fn build_tray_menu(
             app,
             ID_TOGGLE,
             "Stop daemon",
-            true,
+            toggle_enabled,
             Some(menu_icons::stop_icon()),
             None::<&str>,
         )?,
@@ -326,7 +345,7 @@ pub(crate) fn build_tray_menu(
             app,
             ID_TOGGLE,
             "Restart daemon",
-            true,
+            toggle_enabled,
             Some(NativeIcon::Refresh),
             None::<&str>,
         )?,
@@ -469,15 +488,31 @@ pub(crate) fn build_tray_menu(
 /// a one-glance read on the daemon's FSM state, doubling the signal
 /// already carried by the tray icon's tint - on a multi-tray menu bar
 /// that signal is otherwise easy to lose.
-fn build_status_row(app: &AppHandle, state: DaemonState) -> tauri::Result<IconMenuItem<Wry>> {
-    let (text, icon) = match state {
-        DaemonState::Idle => ("Daemon not started", NativeIcon::StatusNone),
-        DaemonState::Starting => (
-            "Daemon is starting\u{2026}",
+fn build_status_row(
+    app: &AppHandle,
+    state: DaemonState,
+    updating: bool,
+) -> tauri::Result<IconMenuItem<Wry>> {
+    // An in-flight upgrade overrides the FSM read-out: the daemon is
+    // deliberately stopped during `uv pip install`, so without this the
+    // header would say "Daemon not started" while the tray is actually
+    // hard at work - exactly the "I clicked Start and nothing happened"
+    // confusion the forced pre-launch update can otherwise create.
+    let (text, icon) = if updating {
+        (
+            "Updating daemon\u{2026}",
             NativeIcon::StatusPartiallyAvailable,
-        ),
-        DaemonState::Running => ("Daemon is running", NativeIcon::StatusAvailable),
-        DaemonState::Crashed => ("Daemon has crashed", NativeIcon::StatusUnavailable),
+        )
+    } else {
+        match state {
+            DaemonState::Idle => ("Daemon not started", NativeIcon::StatusNone),
+            DaemonState::Starting => (
+                "Daemon is starting\u{2026}",
+                NativeIcon::StatusPartiallyAvailable,
+            ),
+            DaemonState::Running => ("Daemon is running", NativeIcon::StatusAvailable),
+            DaemonState::Crashed => ("Daemon has crashed", NativeIcon::StatusUnavailable),
+        }
     };
     IconMenuItem::with_id_and_native_icon(
         app,

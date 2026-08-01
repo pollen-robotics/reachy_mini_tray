@@ -1070,8 +1070,9 @@ fn has_connectivity() -> bool {
 
 /// Fire-and-forget native OS notification. The tray has no main window, so
 /// this is the only way to surface an unexpected decision (e.g. the silent
-/// USB -> Simulation downgrade) to a user who isn't staring at the menu.
-fn notify(app: &AppHandle, title: &str, body: &str) {
+/// USB -> Simulation downgrade, or a forced pre-launch daemon update) to a
+/// user who isn't staring at the menu.
+pub(crate) fn notify(app: &AppHandle, title: &str, body: &str) {
     use tauri_plugin_notification::NotificationExt;
     if let Err(e) = app.notification().builder().title(title).body(body).show() {
         log::warn!("failed to show notification '{}': {}", title, e);

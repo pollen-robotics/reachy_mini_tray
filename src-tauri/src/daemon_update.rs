@@ -522,8 +522,21 @@ fn pre_launch_update(app: &AppHandle) -> bool {
             .unwrap_or_else(|| "?".into()),
         fmt_version(target)
     );
-    // Re-render the menu so the disabled "Updating daemon…" row shows
-    // while the install runs.
+    // The user clicked "Start daemon" and the menu closed; without this the
+    // next minutes look like a dead click (the icon override in
+    // `refresh_status` only helps once they glance at the menu bar). Tell
+    // them explicitly what is happening and that no further action is
+    // needed. Best-effort, like every notification in the tray.
+    crate::daemon::notify(
+        app,
+        "Updating Reachy Mini daemon",
+        &format!(
+            "Installing v{} before start. The daemon will start automatically when done.",
+            fmt_version(target)
+        ),
+    );
+    // Re-render the menu so the icon, tooltip, status row and the disabled
+    // "Updating daemon…" row all show while the install runs.
     request_menu_refresh(app);
     perform_upgrade(app, target);
     true
