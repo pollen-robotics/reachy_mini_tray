@@ -9,7 +9,7 @@ A lightweight Tauri 2 menu-bar app that runs the [Reachy Mini](https://www.polle
 - **First-run bootstrap window** that streams `uv` / Python venv install progress and auto-closes once the daemon is up.
 - **Hugging Face account integration**: sign in via OAuth, see `Signed in as @user · remote on/off` directly in the menu, force-refresh the central relay, sign out.
 - **USB-only by design**: no Bluetooth, no LAN scanning. Mode toggle between `USB` and `Simulation`.
-- **Built-in log viewer** (last 2000 lines, daemon + tray).
+- **Built-in log viewer** (last 500 lines, daemon + tray).
 - **Reset setup**: wipes the data dir and re-bootstraps from scratch (only enabled while the daemon is idle/crashed).
 - **Process-group lifecycle**: the trampoline is its own session leader (`setpgid`), so killing the tray cleanly takes down the entire Python subtree (no orphaned uvicorn, no stale port 8000).
 
