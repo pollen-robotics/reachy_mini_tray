@@ -27,8 +27,8 @@ use crate::logs;
 use crate::paths;
 use crate::state::{
     current_daemon_state, current_generation, current_mode, current_serialport,
-    current_usb_devices, next_generation, set_daemon_state, set_serialport, AppState, DaemonState,
-    Mode,
+    current_usb_devices, next_generation, set_crash_cause, set_daemon_state, set_serialport,
+    AppState, CrashCause, DaemonState, Mode,
 };
 use crate::tray_menu::refresh_status;
 
@@ -283,8 +283,32 @@ async fn monitor_daemon_output(
                 // to Idle and we should respect that.
                 let cur = current_daemon_state(&app_state);
                 if matches!(cur, DaemonState::Starting | DaemonState::Running) {
+                    let cause = if cur == DaemonState::Starting {
+                        CrashCause::Startup
+                    } else {
+                        CrashCause::Runtime
+                    };
+                    set_crash_cause(&app_state, cause);
                     set_daemon_state(&app_state, DaemonState::Crashed);
                     refresh_status(&app);
+                    // An unexpected death is otherwise invisible while the
+                    // menu is closed (only the icon tint changes, easy to
+                    // miss in a crowded menu bar). Point the user at the
+                    // logs so "my robot stopped responding" has a next step.
+                    match cause {
+                        CrashCause::Startup => notify(
+                            &app,
+                            "Reachy Mini daemon failed to start",
+                            "The daemon exited during startup. \
+                             Open \u{201c}Show logs\u{2026}\u{201d} from the tray menu for details.",
+                        ),
+                        CrashCause::Runtime => notify(
+                            &app,
+                            "Reachy Mini daemon stopped",
+                            "The daemon stopped unexpectedly. \
+                             Open \u{201c}Show logs\u{2026}\u{201d} from the tray menu for details.",
+                        ),
+                    }
                 }
             }
             _ => {}
@@ -525,8 +549,18 @@ fn start_healthcheck(app: AppHandle, generation: u64) {
                     bootstrapping,
                     started.elapsed()
                 );
+                set_crash_cause(&app_state, CrashCause::Startup);
                 set_daemon_state(&app_state, DaemonState::Crashed);
                 refresh_status(&app);
+                notify(
+                    &app,
+                    "Reachy Mini daemon failed to start",
+                    &format!(
+                        "No output from the daemon for {} seconds; giving up. \
+                         Open \u{201c}Show logs\u{2026}\u{201d} from the tray menu for details.",
+                        silence.as_secs()
+                    ),
+                );
                 return;
             }
 
@@ -1157,6 +1191,9 @@ pub(crate) fn start_daemon(app: &AppHandle) {
         if let Err(e) = app.emit(EVENT_SETUP_PROGRESS, &progress) {
             log::warn!("failed to emit offline setup notice: {}", e);
         }
+        // No notification here: the first-run window is open, front and
+        // center, and already displays the "No internet connection" message.
+        set_crash_cause(&app_state, CrashCause::Startup);
         set_daemon_state(&app_state, DaemonState::Crashed);
         refresh_status(app);
         return;
@@ -1195,8 +1232,15 @@ pub(crate) fn start_daemon(app: &AppHandle) {
         }
         Err(e) => {
             log::error!("failed to spawn daemon: {}", e);
+            set_crash_cause(&app_state, CrashCause::Startup);
             set_daemon_state(&app_state, DaemonState::Crashed);
             refresh_status(app);
+            notify(
+                app,
+                "Reachy Mini daemon failed to start",
+                "Could not launch the daemon process. \
+                 Open \u{201c}Show logs\u{2026}\u{201d} from the tray menu for details.",
+            );
             return;
         }
     }

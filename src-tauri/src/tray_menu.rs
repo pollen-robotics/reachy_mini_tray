@@ -17,8 +17,8 @@ use crate::daemon_update::{self, UpdateSnapshot};
 use crate::hf_auth;
 use crate::menu_icons;
 use crate::state::{
-    current_daemon_state, current_mode, current_serialport, current_usb_devices, AppState,
-    DaemonState, IconCache, Mode,
+    current_crash_cause, current_daemon_state, current_mode, current_serialport,
+    current_usb_devices, AppState, CrashCause, DaemonState, IconCache, Mode,
 };
 
 pub(crate) const TRAY_ID: &str = "main";
@@ -132,9 +132,11 @@ pub(crate) fn refresh_status(app: &AppHandle) {
         .map(|s| s.snapshot())
         .unwrap_or_default();
     let devices = current_usb_devices(&app_state);
+    let crash_cause = current_crash_cause(&app_state);
     match build_tray_menu(
         app,
         state,
+        crash_cause,
         mode,
         serialport.as_deref(),
         &devices,
@@ -279,10 +281,15 @@ fn account_slot(
 }
 
 /// Build a fresh tray menu reflecting the given
-/// `(state, mode, serialport, usb_devices, snap)`.
+/// `(state, crash_cause, mode, serialport, usb_devices, snap, update)`.
+// Deliberately a flat parameter list: this is a pure projection of the app
+// state onto a menu, called from exactly two places (boot + refresh), and a
+// bundling struct would just move the same eight names one level down.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tray_menu(
     app: &AppHandle,
     state: DaemonState,
+    crash_cause: Option<CrashCause>,
     mode: Mode,
     serialport: Option<&str>,
     usb_devices: &[crate::usb::UsbDevice],
@@ -296,7 +303,7 @@ pub(crate) fn build_tray_menu(
     // colored native dot icon that matches the tray icon's tint. Lets
     // the user read the daemon's FSM state without having to map the
     // tray-icon tint to a meaning.
-    let status_row = build_status_row(app, state, update.updating)?;
+    let status_row = build_status_row(app, state, crash_cause, update.updating)?;
 
     // ---- Toggle (Start / Stop / Restart) ----
     //
@@ -491,6 +498,7 @@ pub(crate) fn build_tray_menu(
 fn build_status_row(
     app: &AppHandle,
     state: DaemonState,
+    crash_cause: Option<CrashCause>,
     updating: bool,
 ) -> tauri::Result<IconMenuItem<Wry>> {
     // An in-flight upgrade overrides the FSM read-out: the daemon is
@@ -511,7 +519,19 @@ fn build_status_row(
                 NativeIcon::StatusPartiallyAvailable,
             ),
             DaemonState::Running => ("Daemon is running", NativeIcon::StatusAvailable),
-            DaemonState::Crashed => ("Daemon has crashed", NativeIcon::StatusUnavailable),
+            // "failed to start" vs "stopped unexpectedly": a launch that
+            // never took off and a healthy daemon dying mid-session call
+            // for different reflexes (retry / check USB vs check logs),
+            // so don't collapse them into one generic "crashed".
+            DaemonState::Crashed => match crash_cause {
+                Some(CrashCause::Startup) => {
+                    ("Daemon failed to start", NativeIcon::StatusUnavailable)
+                }
+                Some(CrashCause::Runtime) => {
+                    ("Daemon stopped unexpectedly", NativeIcon::StatusUnavailable)
+                }
+                None => ("Daemon has crashed", NativeIcon::StatusUnavailable),
+            },
         }
     };
     IconMenuItem::with_id_and_native_icon(

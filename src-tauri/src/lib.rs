@@ -186,6 +186,7 @@ pub fn run() {
             let menu = build_tray_menu(
                 &app.handle().clone(),
                 DaemonState::Idle,
+                None,
                 boot_mode,
                 None,
                 &[],

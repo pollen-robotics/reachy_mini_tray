@@ -15,7 +15,8 @@
 //! 3. `state.serialport`
 //! 4. `state.usb_devices`
 //! 5. `state.state`
-//! 6. `state.generation`
+//! 6. `state.crash_cause`
+//! 7. `state.generation`
 //!
 //! Accessors below each take a single lock and release it before returning,
 //! so external callers should generally not need to lock anything by hand.
@@ -63,6 +64,19 @@ pub enum DaemonState {
     Crashed,
 }
 
+/// How we ended up in [`DaemonState::Crashed`]. Only consulted while the
+/// FSM reads `Crashed`; drives the status-row wording ("failed to start"
+/// vs "stopped unexpectedly") so the user knows whether their launch never
+/// took off or a healthy daemon died under them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CrashCause {
+    /// The daemon never reached `Running`: spawn failure, exit during
+    /// startup, startup-watchdog timeout, or the first-run offline abort.
+    Startup,
+    /// A previously `Running` daemon terminated on its own.
+    Runtime,
+}
+
 /// Tauri-managed app state. Everything mutable that outlives a single
 /// command call lives here.
 pub struct AppState {
@@ -81,6 +95,10 @@ pub struct AppState {
     /// render the per-device rows.
     pub usb_devices: Mutex<Vec<UsbDevice>>,
     pub state: Mutex<DaemonState>,
+    /// Why the last transition to `Crashed` happened. Written right before
+    /// `set_daemon_state(Crashed)` at every crash site; stale values are
+    /// harmless because it is only read while the FSM is `Crashed`.
+    pub crash_cause: Mutex<Option<CrashCause>>,
     /// Monotonically increases each time we (re)start a daemon. Used to
     /// discard late healthcheck / monitor callbacks from a previous run
     /// (e.g. user clicked Stop while bootstrap was still in progress).
@@ -109,6 +127,7 @@ impl AppState {
             serialport: Mutex::new(None),
             usb_devices: Mutex::new(Vec::new()),
             state: Mutex::new(DaemonState::Idle),
+            crash_cause: Mutex::new(None),
             generation: Mutex::new(0),
             startup_activity: Mutex::new(StartupActivity {
                 last_output: Instant::now(),
@@ -184,6 +203,17 @@ pub(crate) fn set_daemon_state(state: &AppState, new_state: DaemonState) {
     if let Ok(mut g) = state.state.lock() {
         *g = new_state;
     }
+}
+
+/// Record why the daemon is about to be (or was just) marked `Crashed`.
+pub(crate) fn set_crash_cause(state: &AppState, cause: CrashCause) {
+    if let Ok(mut g) = state.crash_cause.lock() {
+        *g = Some(cause);
+    }
+}
+
+pub(crate) fn current_crash_cause(state: &AppState) -> Option<CrashCause> {
+    state.crash_cause.lock().ok().and_then(|g| *g)
 }
 
 /// Record fresh daemon output (any stdout/stderr line). Called on the
