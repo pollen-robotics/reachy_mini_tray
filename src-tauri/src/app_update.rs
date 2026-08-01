@@ -87,20 +87,6 @@ pub(crate) fn start_update_check(app: AppHandle) {
     });
 }
 
-/// Manual check triggered from the tray menu. Same path as the startup
-/// check, but logs an explicit "already latest" so a user click always
-/// produces feedback in the logs window.
-pub(crate) fn check_now(app: &AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        match check_impl(&app).await {
-            Ok(true) => {}
-            Ok(false) => log::info!("[app-update] manual check: already on the latest version"),
-            Err(e) => log::warn!("[app-update] manual check failed: {}", e),
-        }
-    });
-}
-
 /// Query the updater endpoint. On a hit, cache the metadata, open the
 /// overlay and emit `app-update:available`. Returns whether an update was
 /// found.

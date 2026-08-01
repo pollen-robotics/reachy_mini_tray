@@ -9,6 +9,11 @@
 //! surfaces an "Update daemon" row in the tray menu that the user can
 //! click to upgrade in place.
 //!
+//! On top of that, [`update_then_start`] is a *forced* pre-launch gate:
+//! every user-facing daemon start goes through it, and when an update is
+//! known the venv is upgraded before the daemon boots - mirroring the
+//! tray's own forced self-update policy (see [`crate::app_update`]).
+//!
 //! Why GitHub Releases (and not PyPI)? The mobile app already resolves the
 //! reference this exact way (`releases/latest` -> `tag_name`), so a robot's
 //! "needs an update" prompt on mobile and the desktop tray agree on what
@@ -30,7 +35,6 @@
 //! We never nag on a version we can't reason about.
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -401,31 +405,128 @@ pub fn start_update(app: &AppHandle) {
     request_menu_refresh(app);
 
     let app = app.clone();
+    std::thread::spawn(move || perform_upgrade(&app, target));
+}
+
+/// Worker-thread body shared by the menu-row trigger ([`start_update`]) and
+/// the pre-launch gate ([`update_then_start`]): run the upgrade, re-read the
+/// venv so the snapshot reflects reality whether the upgrade succeeded,
+/// partially applied or failed, release the `updating` flag, and log the
+/// outcome. The caller must have acquired the flag via `try_begin_update`.
+fn perform_upgrade(app: &AppHandle, target: SemVer) {
+    let result = run_upgrade(app, target);
+
+    let store = app.state::<DaemonUpdateStore>();
+    store.set_installed(read_installed());
+    store.end_update();
+
+    match result {
+        Ok(()) => logs::push_external(
+            app,
+            "tray",
+            "INFO",
+            format!("Daemon upgraded to {}", fmt_version(target)),
+        ),
+        Err(e) => logs::push_external(
+            app,
+            "tray",
+            "ERROR",
+            format!("Daemon upgrade failed: {}", e),
+        ),
+    }
+    request_menu_refresh(app);
+}
+
+// ============================================================================
+// PRE-LAUNCH GATE
+// ============================================================================
+
+/// Guards against two overlapping launch attempts (e.g. a double-click on
+/// "Start daemon"). The whole check-upgrade-start sequence runs on a
+/// background thread, so without this flag two threads could both observe
+/// an `Idle` daemon and spawn two trampolines racing for port 8000.
+static LAUNCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Forced-update gate wrapped around every user-facing daemon launch (tray
+/// toggle, first-run bootstrap, post-reset restart).
+///
+/// Mirrors the tray's own forced self-update policy: when a newer daemon
+/// release is known - or discoverable through the TTL-cached GitHub lookup -
+/// the venv is upgraded *before* the daemon boots, so a launch never runs a
+/// stale version. Fail-open on every step: offline, GitHub rate limits, or a
+/// failed `uv pip install` all fall through to starting whatever is
+/// currently installed.
+///
+/// Doubles as the off-main-thread wrapper for `start_daemon`: the version
+/// lookup and the upgrade can take seconds to minutes, and even a plain
+/// start shells out to `lsof` and sleeps in `reap_orphaned_daemons` - none
+/// of which belongs on the menu event thread.
+pub fn update_then_start(app: &AppHandle) {
+    if LAUNCH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        log::info!("daemon launch ignored: another launch is already in flight");
+        return;
+    }
+
+    let app = app.clone();
     std::thread::spawn(move || {
-        let result = run_upgrade(&app, target);
-
-        let store = app.state::<DaemonUpdateStore>();
-        // Re-read the venv so the snapshot reflects reality whether the
-        // upgrade succeeded, partially applied, or failed.
-        store.set_installed(read_installed());
-        store.end_update();
-
-        match result {
-            Ok(()) => logs::push_external(
-                &app,
-                "tray",
-                "INFO",
-                format!("Daemon upgraded to {}", fmt_version(target)),
-            ),
-            Err(e) => logs::push_external(
-                &app,
-                "tray",
-                "ERROR",
-                format!("Daemon upgrade failed: {}", e),
-            ),
+        if pre_launch_update(&app) {
+            start_daemon(&app);
         }
-        request_menu_refresh(&app);
+        LAUNCH_IN_FLIGHT.store(false, Ordering::SeqCst);
     });
+}
+
+/// Upgrade step of the pre-launch gate. Returns `true` when the caller
+/// should proceed with `start_daemon` (the overwhelmingly common case,
+/// including a failed upgrade - the previous version is still usable), and
+/// `false` only when a concurrent upgrade owns the venv right now.
+fn pre_launch_update(app: &AppHandle) -> bool {
+    // No venv yet (first run, or right after "Reset setup…"): the
+    // trampoline bootstrap installs the pinned version anyway, so there is
+    // nothing to upgrade and no point querying GitHub.
+    if !paths::is_bootstrap_done() {
+        return true;
+    }
+
+    let store = app.state::<DaemonUpdateStore>();
+    // A menu-row upgrade is already mutating the venv; racing it with a
+    // second `uv pip install` (or booting Python off half-swapped files)
+    // would corrupt the environment. That upgrade thread owns the daemon
+    // restart when it took one down, so we neither upgrade nor start here.
+    if store.updating() {
+        log::info!("pre-launch update skipped: an upgrade is already in progress");
+        return false;
+    }
+
+    // Fresh snapshot: the hourly poller may not have run yet when the user
+    // clicks Start right after boot (initial delay 20 s), so re-read the
+    // venv and the (TTL-cached) GitHub latest here.
+    store.set_installed(read_installed());
+    let _ = store.latest_cached_or_fetch();
+    let snap = store.snapshot();
+
+    let Some(target) = snap.latest.filter(|_| snap.available()) else {
+        return true;
+    };
+    if !store.try_begin_update() {
+        return true;
+    }
+
+    log::info!(
+        "forced pre-launch daemon update: {} -> {}",
+        snap.installed
+            .map(fmt_version)
+            .unwrap_or_else(|| "?".into()),
+        fmt_version(target)
+    );
+    // Re-render the menu so the disabled "Updating daemon…" row shows
+    // while the install runs.
+    request_menu_refresh(app);
+    perform_upgrade(app, target);
+    true
 }
 
 /// Stop the daemon (if running), `uv pip install -U` the target version into
@@ -494,7 +595,9 @@ fn upgrade_venv(app: &AppHandle, data_dir: &Path, venv: &str, spec: &str) -> Res
         .to_str()
         .ok_or("venv python path is not valid UTF-8")?;
 
-    let output = Command::new(&uv)
+    // `hidden_command`: this runs before *every* daemon launch on Windows,
+    // so a bare `Command` would flash a console window at each Start click.
+    let output = crate::proc::hidden_command(&uv)
         .current_dir(data_dir)
         .env("UV_PYTHON_INSTALL_DIR", data_dir)
         .env("UV_WORKING_DIR", data_dir)

@@ -66,6 +66,10 @@ const POLL_BURST_DURATION: Duration = Duration::from_secs(20);
 
 const POLL_INTERVAL_IDLE: Duration = Duration::from_secs(5);
 
+/// Consecutive `is_logged_in: false` poll responses required before the
+/// poller believes a logout (defense against transient whoami-v2 429s).
+const LOGOUT_CONFIRM_TICKS: u32 = 2;
+
 /// Hard cap for the OAuth poll loop. The daemon's session itself expires
 /// after 600 s (`hf_auth.create_oauth_session` -> `expires_in`).
 const OAUTH_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -510,6 +514,58 @@ pub fn refresh_relay(app: &AppHandle) {
 // STATUS POLLER
 // ============================================================================
 
+/// Pure "are we logged in?" reconciliation for one poll tick.
+///
+/// The daemon's `/status` endpoint hits HuggingFace's `whoami-v2` on every
+/// call with no caching, so HF rate-limits us to 429 and we get back
+/// `is_logged_in: false` even when the token is perfectly valid. We defend
+/// against that with three signals:
+///
+/// 1. trust positive responses immediately (and refresh the sticky
+///    username / reset the negative-streak counter);
+/// 2. require [`LOGOUT_CONFIRM_TICKS`] consecutive negatives before
+///    believing a logout (defense against transient 429);
+/// 3. if the central relay is connected, the user MUST be logged in (the
+///    relay can't register without a valid token), so keep the login
+///    regardless of what `/status` said.
+///
+/// `sticky_username` / `consecutive_logged_out` are the poller's cross-tick
+/// memory; this function owns all their mutations so the whole policy is
+/// testable without HTTP.
+fn reconcile_auth(
+    raw: &AuthStatus,
+    relay_connected: bool,
+    sticky_username: &mut Option<String>,
+    consecutive_logged_out: &mut u32,
+) -> AuthStatus {
+    let mut effective = raw.clone();
+    if raw.is_logged_in {
+        *consecutive_logged_out = 0;
+        if let Some(name) = raw.username.as_ref() {
+            if !name.is_empty() {
+                *sticky_username = Some(name.clone());
+            }
+        }
+    } else {
+        *consecutive_logged_out = consecutive_logged_out.saturating_add(1);
+        let still_trust_login = relay_connected || *consecutive_logged_out < LOGOUT_CONFIRM_TICKS;
+        if still_trust_login && sticky_username.is_some() {
+            effective.is_logged_in = true;
+            effective.username = sticky_username.clone();
+            log::debug!(
+                "auth poller: keeping sticky login (raw whoami=false, likely 429; relay_connected={}, ticks={}/{})",
+                relay_connected,
+                consecutive_logged_out,
+                LOGOUT_CONFIRM_TICKS
+            );
+        } else if !still_trust_login {
+            // Confirmed logout: clear sticky cache.
+            *sticky_username = None;
+        }
+    }
+    effective
+}
+
 /// Spawn a single long-lived blocking thread that polls `/status` and
 /// `/relay-status` whenever the daemon is `Running`. Updates the cached
 /// `AuthStatusStore` and triggers a menu refresh on every change.
@@ -531,7 +587,6 @@ pub fn start_status_poller(app: AppHandle) {
         // multiple in a row OR the relay has clearly dropped, otherwise
         // a single 429 would log the user out in the UI.
         let mut consecutive_logged_out: u32 = 0;
-        const LOGOUT_CONFIRM_TICKS: u32 = 2;
 
         loop {
             let app_state = app.state::<AppState>();
@@ -608,45 +663,14 @@ pub fn start_status_poller(app: AppHandle) {
 
                 let relay_connected = relay.as_ref().map(|r| r.is_connected).unwrap_or(false);
 
-                // ----- "Are we logged in?" reconciliation -----
-                // The daemon's `/status` endpoint hits HuggingFace's
-                // `whoami-v2` on every call with no caching, so HF rate-
-                // limits us to 429 and we get back `is_logged_in: false`
-                // even when the token is perfectly valid. We defend
-                // against that with three signals:
-                //   1. trust positive responses immediately;
-                //   2. require N consecutive negatives before believing a
-                //      logout (defense against transient 429);
-                //   3. if the central relay is connected, the user MUST
-                //      be logged in (the relay can't register without a
-                //      valid token), so override `is_logged_in` to true
-                //      regardless of what `/status` said.
-                let mut effective_auth = raw_auth.clone();
-                if raw_auth.is_logged_in {
-                    consecutive_logged_out = 0;
-                    if let Some(name) = raw_auth.username.as_ref() {
-                        if !name.is_empty() {
-                            sticky_username = Some(name.clone());
-                        }
-                    }
-                } else {
-                    consecutive_logged_out = consecutive_logged_out.saturating_add(1);
-                    let still_trust_login =
-                        relay_connected || consecutive_logged_out < LOGOUT_CONFIRM_TICKS;
-                    if still_trust_login && sticky_username.is_some() {
-                        effective_auth.is_logged_in = true;
-                        effective_auth.username = sticky_username.clone();
-                        log::debug!(
-                            "auth poller: keeping sticky login (raw whoami=false, likely 429; relay_connected={}, ticks={}/{})",
-                            relay_connected,
-                            consecutive_logged_out,
-                            LOGOUT_CONFIRM_TICKS
-                        );
-                    } else if !still_trust_login {
-                        // Confirmed logout: clear sticky cache.
-                        sticky_username = None;
-                    }
-                }
+                // "Are we logged in?" reconciliation - full policy and
+                // rationale documented on `reconcile_auth`.
+                let effective_auth = reconcile_auth(
+                    &raw_auth,
+                    relay_connected,
+                    &mut sticky_username,
+                    &mut consecutive_logged_out,
+                );
 
                 let signature = format!(
                     "{}|{}|{}|{}",
@@ -759,5 +783,95 @@ mod tests {
         assert!(!store.in_burst_window());
         store.trigger_burst();
         assert!(store.in_burst_window());
+    }
+
+    // ---- reconcile_auth (429-resilience policy) ----
+
+    fn logged_in(user: &str) -> AuthStatus {
+        AuthStatus {
+            is_logged_in: true,
+            username: Some(user.to_string()),
+        }
+    }
+
+    fn logged_out() -> AuthStatus {
+        AuthStatus::default()
+    }
+
+    #[test]
+    fn positive_response_sets_sticky_and_resets_counter() {
+        let mut sticky = None;
+        let mut ticks = 5;
+        let eff = reconcile_auth(&logged_in("tfrere"), false, &mut sticky, &mut ticks);
+        assert!(eff.is_logged_in);
+        assert_eq!(sticky.as_deref(), Some("tfrere"));
+        assert_eq!(ticks, 0);
+    }
+
+    #[test]
+    fn single_negative_keeps_sticky_login() {
+        // One `false` after a valid login is most likely a whoami-v2 429:
+        // the UI must NOT flap to "Sign in...".
+        let mut sticky = Some("tfrere".to_string());
+        let mut ticks = 0;
+        let eff = reconcile_auth(&logged_out(), false, &mut sticky, &mut ticks);
+        assert!(eff.is_logged_in);
+        assert_eq!(eff.username.as_deref(), Some("tfrere"));
+        assert_eq!(ticks, 1);
+    }
+
+    #[test]
+    fn confirmed_negatives_log_out_and_clear_sticky() {
+        let mut sticky = Some("tfrere".to_string());
+        let mut ticks = 0;
+        // First negative: still trusted.
+        let eff = reconcile_auth(&logged_out(), false, &mut sticky, &mut ticks);
+        assert!(eff.is_logged_in);
+        // Second negative reaches LOGOUT_CONFIRM_TICKS: believed.
+        let eff = reconcile_auth(&logged_out(), false, &mut sticky, &mut ticks);
+        assert!(!eff.is_logged_in);
+        assert!(sticky.is_none(), "sticky username must be cleared");
+    }
+
+    #[test]
+    fn connected_relay_overrides_any_negative_streak() {
+        // The relay can't register without a valid token, so as long as
+        // it's connected the login is kept no matter how many negatives.
+        let mut sticky = Some("tfrere".to_string());
+        let mut ticks = 0;
+        for _ in 0..10 {
+            let eff = reconcile_auth(&logged_out(), true, &mut sticky, &mut ticks);
+            assert!(eff.is_logged_in);
+            assert_eq!(eff.username.as_deref(), Some("tfrere"));
+        }
+        assert!(sticky.is_some());
+    }
+
+    #[test]
+    fn negative_without_sticky_is_logged_out_immediately() {
+        // Never-logged-in user: nothing to keep sticky, report logged out.
+        let mut sticky = None;
+        let mut ticks = 0;
+        let eff = reconcile_auth(&logged_out(), false, &mut sticky, &mut ticks);
+        assert!(!eff.is_logged_in);
+        assert!(eff.username.is_none());
+    }
+
+    #[test]
+    fn empty_username_does_not_poison_sticky() {
+        let mut sticky = Some("tfrere".to_string());
+        let mut ticks = 0;
+        let eff = reconcile_auth(
+            &AuthStatus {
+                is_logged_in: true,
+                username: Some(String::new()),
+            },
+            false,
+            &mut sticky,
+            &mut ticks,
+        );
+        assert!(eff.is_logged_in);
+        // Sticky keeps the last non-empty name.
+        assert_eq!(sticky.as_deref(), Some("tfrere"));
     }
 }

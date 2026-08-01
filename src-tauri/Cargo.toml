@@ -10,28 +10,35 @@ name = "reachy_mini_tray_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "=2.5.6", features = [] }
+tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
-tauri                          = { version = "=2.10.3", features = ["macos-private-api", "tray-icon", "image-png"] }
+# 2.11.1+ required: fixes CVE-2026-42184 (origin confusion on Windows/Android,
+# GHSA-7gmj-67g7-phm9) + enforces ACL checks for remote origins.
+tauri                          = { version = "=2.11.5", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-shell             = "=2.3.5"
-tauri-plugin-single-instance   = "=2.4.1"
+tauri-plugin-single-instance   = "=2.4.3"
 # Self-update of the tray app itself (distinct from the daemon update in
 # `daemon_update.rs`). Fetches a signed `latest.json` from the GitHub Release,
 # verifies the minisign signature against the embedded pubkey, downloads and
 # installs the new bundle. The relaunch after install uses the built-in
 # `AppHandle::restart()`, so no extra process plugin is needed.
 tauri-plugin-updater           = "2"
-log                            = "=0.4.22"
-serde                          = { version = "=1.0.219", features = ["derive"] }
-serde_json                     = "=1.0.140"
+# Native OS notifications. The tray has no main window, so this is the only
+# channel to surface unexpected decisions (e.g. the automatic USB ->
+# Simulation downgrade when no robot is detected) to a user who isn't
+# looking at the menu.
+tauri-plugin-notification      = "2"
+log                            = "=0.4.33"
+serde                          = { version = "=1.0.229", features = ["derive"] }
+serde_json                     = "=1.0.151"
 # Blocking HTTP client used to poll the daemon's `/daemon/status` readiness
 # endpoint and the `/api/hf-auth/*` routes (loopback, no TLS needed), plus the
 # GitHub Releases API check in `daemon_update.rs` (HTTPS, hence the `rustls`
 # feature - reqwest 0.13's default TLS provider, which also matches what
 # `tauri-plugin-shell` already pulls transitively so we add no new backend).
 # `json` enables the `.json::<T>()` decoder.
-reqwest                        = { version = "=0.13.2", default-features = false, features = ["blocking", "json", "rustls"] }
+reqwest                        = { version = "=0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 # Cross-platform USB serial-port enumeration. We use it (read-only) to
 # detect Reachy Mini devices plugged via USB so the tray menu can list
 # them by name and let the user pick one. We never actually open the port

@@ -51,11 +51,6 @@ pub(crate) const ID_ACCOUNT_SIGNIN: &str = "account_signin";
 pub(crate) const ID_ACCOUNT_SIGNOUT: &str = "account_signout";
 pub(crate) const ID_ACCOUNT_REFRESH_RELAY: &str = "account_refresh_relay";
 pub(crate) const ID_SHOW_LOGS: &str = "show_logs";
-/// Manual "Check for Updates…" for the tray app bundle itself (distinct
-/// from `ID_UPDATE_DAEMON`, which upgrades the Python daemon). Click
-/// triggers `app_update::check_now`, which opens the update overlay if a
-/// newer release is available. Always present.
-pub(crate) const ID_UPDATE_APP: &str = "update_app";
 pub(crate) const ID_RESET_SETUP: &str = "reset_setup";
 /// Shown only when a newer daemon release is available (or an upgrade is in
 /// flight). Click triggers `daemon_update::start_update`.
@@ -170,9 +165,8 @@ pub fn request_menu_refresh(app: &AppHandle) {
 /// the menu accordingly. Topology changes (flat MenuItem <-> Submenu) are
 /// not expressible via `set_text` alone.
 enum AccountSlot {
-    /// Daemon not running: no row at all.
-    Hidden,
-    /// Logged out (or OAuth in flight). Flat top-level `MenuItem`.
+    /// Logged out, OAuth in flight, or daemon not running (disabled row).
+    /// Flat top-level `MenuItem`.
     Flat(MenuItem<Wry>),
     /// Logged in. Submenu whose label is the live account status; its
     /// children are the secondary actions.
@@ -212,7 +206,18 @@ fn account_slot(
     snap: &hf_auth::AuthSnapshot,
 ) -> tauri::Result<AccountSlot> {
     if !matches!(state, DaemonState::Running) {
-        return Ok(AccountSlot::Hidden);
+        // The account feature exists but needs a running daemon (it owns the
+        // OAuth flow and the token storage). Render a disabled row instead
+        // of hiding it entirely: an invisible feature reads as "no HF
+        // integration at all" to a user who's never seen the daemon run.
+        let item = MenuItem::with_id(
+            app,
+            ID_ACCOUNT_SIGNIN,
+            "Sign in with Hugging Face\u{2026} (start the daemon first)",
+            false,
+            None::<&str>,
+        )?;
+        return Ok(AccountSlot::Flat(item));
     }
 
     if snap.oauth_in_flight {
@@ -336,16 +341,6 @@ pub(crate) fn build_tray_menu(
 
     // ---- Footer ----
     let show_logs = MenuItem::with_id(app, ID_SHOW_LOGS, "Show logs\u{2026}", true, None::<&str>)?;
-    // Manual self-update check. The startup auto-check already opens the
-    // overlay when a release is behind, but this lets an impatient user
-    // force a check on demand.
-    let update_app = MenuItem::with_id(
-        app,
-        ID_UPDATE_APP,
-        "Check for Updates\u{2026}",
-        true,
-        None::<&str>,
-    )?;
     // Reset setup wipes the daemon's data dir; doing it while the daemon
     // is `Starting` or `Running` would race against open file handles
     // (venv binaries currently exec'd, sqlite locks, serial port, etc.).
@@ -445,7 +440,6 @@ pub(crate) fn build_tray_menu(
             items.push(&sep_account);
             items.push(sub);
         }
-        AccountSlot::Hidden => {}
     }
 
     // Update row sits in its own section just above the footer so it reads
@@ -457,7 +451,6 @@ pub(crate) fn build_tray_menu(
 
     items.push(&sep_footer);
     items.push(&show_logs);
-    items.push(&update_app);
     items.push(&reset_setup);
     items.push(&sep_quit);
     items.push(&quit);

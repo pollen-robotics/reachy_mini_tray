@@ -44,11 +44,20 @@ const HEALTHCHECK_PATH: &str = "/daemon/status";
 /// Poll cadence while the daemon is in `Starting` state.
 const HEALTHCHECK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Hard timeout for reaching `Running` after a Start. Sized to cover a fresh
-/// `uv-trampoline` bootstrap on a slow first-run machine (uv download ~15 s,
-/// Python install ~30 s, venv + reachy-mini install ~60 s, GStreamer pre-warm
-/// ~120 s, plus headroom). Subsequent starts are typically <5 s.
-const HEALTHCHECK_MAX_DURATION: Duration = Duration::from_secs(300);
+/// Startup watchdog budget, measured from the *last output line* the
+/// trampoline/daemon produced (not from spawn time). The daemon is declared
+/// crashed only after this much **silence** while still `Starting`, so a
+/// slow-but-alive bootstrap can never hit a false timeout. Mirrors the
+/// desktop app's production-proven `DAEMON_CONFIG.STARTUP.TIMEOUT_NORMAL`.
+const STARTUP_INACTIVITY_BUDGET: Duration = Duration::from_secs(90);
+
+/// Same watchdog budget while a first-run bootstrap is in progress (between
+/// the first `[bootstrap]` line and `Setup complete!`). uv download, Python
+/// install and the GStreamer registry scan can legitimately stay quiet for
+/// minutes on a slow machine; the trampoline's 5 s heartbeat normally keeps
+/// re-arming the deadline anyway. Mirrors the desktop app's
+/// `TIMEOUT_BOOTSTRAP` (10 min).
+const STARTUP_INACTIVITY_BUDGET_BOOTSTRAP: Duration = Duration::from_secs(600);
 
 /// Per-request HTTP timeout used while polling `/daemon/status`.
 const HEALTHCHECK_HTTP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -62,7 +71,7 @@ const CONNECTIVITY_PROBES: [&str; 2] = ["https://pypi.org", "https://github.com"
 
 /// Per-probe timeout for the first-run connectivity check. Short so an
 /// offline machine fails fast (a few seconds) instead of sitting through the
-/// 5-minute [`HEALTHCHECK_MAX_DURATION`] bootstrap timeout.
+/// [`STARTUP_INACTIVITY_BUDGET`] watchdog window.
 const CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Minimum delay before we trust the first healthcheck success after a
@@ -300,6 +309,17 @@ fn handle_daemon_line(app: &AppHandle, raw_line: &str, default_level: &str) {
     let level = logs::parse_line_level(trimmed, default_level);
     logs::push_external(app, "daemon", &level, trimmed.to_string());
 
+    // Feed the startup watchdog: any output line re-arms the inactivity
+    // deadline, and `[bootstrap]` lines flip the larger bootstrap budget
+    // on/off (see `start_healthcheck`).
+    {
+        let app_state = app.state::<AppState>();
+        crate::state::note_daemon_output(&app_state);
+        if let Some(flag) = derive_bootstrap_flag(trimmed) {
+            crate::state::set_bootstrapping(&app_state, flag);
+        }
+    }
+
     let first_run_open = app.get_webview_window(FIRST_RUN_WINDOW_LABEL).is_some();
     if !first_run_open {
         return;
@@ -310,6 +330,21 @@ fn handle_daemon_line(app: &AppHandle, raw_line: &str, default_level: &str) {
     if let Err(e) = app.emit(EVENT_SETUP_PROGRESS, &progress) {
         log::warn!("failed to emit setup:progress: {}", e);
     }
+}
+
+/// Decide whether a daemon output line changes the "bootstrapping" flag.
+///
+/// Returns `Some(true)` on any `[bootstrap]` progress line, `Some(false)`
+/// once `Setup complete` is seen, and `None` for every other line (which
+/// must leave the flag untouched: `[prewarm:*]` lines and heartbeats arrive
+/// mid-bootstrap without carrying the `[bootstrap]` prefix). Mirrors the
+/// desktop app's `updateBootstrapFlag`.
+pub(crate) fn derive_bootstrap_flag(line: &str) -> Option<bool> {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("[bootstrap]") {
+        return None;
+    }
+    Some(!lower.contains("setup complete"))
 }
 
 /// Heuristic mapping from `uv-trampoline` and daemon log lines to a
@@ -432,9 +467,17 @@ pub(crate) fn derive_bootstrap_event(line: &str) -> BootstrapProgress {
 // ============================================================================
 
 /// Spawn a dedicated thread that polls `/daemon/status` until the daemon
-/// becomes ready, fails to come up within `HEALTHCHECK_MAX_DURATION`, or its
+/// becomes ready, goes silent for longer than the inactivity budget, or its
 /// generation moves on (Stop / Restart). Transitions Starting -> Running on
-/// the first 200 OK and Starting -> Crashed on hard timeout.
+/// the first 200 OK and Starting -> Crashed on watchdog expiry.
+///
+/// The watchdog is **activity-based**, not a hard cap: every stdout/stderr
+/// line from the trampoline/daemon re-arms the deadline (see
+/// `handle_daemon_line`), and the budget grows from
+/// [`STARTUP_INACTIVITY_BUDGET`] to [`STARTUP_INACTIVITY_BUDGET_BOOTSTRAP`]
+/// while `[bootstrap]` lines are streaming. This mirrors the desktop app's
+/// production behaviour and removes the false-timeout failure mode where a
+/// slow first-run machine got killed mid-bootstrap by a fixed cap.
 ///
 /// Plain blocking `reqwest`: HTTP is loopback, latency is sub-ms, and we
 /// don't want to share a tokio runtime with the sidecar event loop.
@@ -466,8 +509,22 @@ fn start_healthcheck(app: AppHandle, generation: u64) {
                 return;
             }
 
-            if started.elapsed() > HEALTHCHECK_MAX_DURATION {
-                log::error!("healthcheck timed out after {:?}", HEALTHCHECK_MAX_DURATION);
+            let (last_output, bootstrapping) = crate::state::startup_snapshot(&app_state);
+            let budget = if bootstrapping {
+                STARTUP_INACTIVITY_BUDGET_BOOTSTRAP
+            } else {
+                STARTUP_INACTIVITY_BUDGET
+            };
+            let silence = last_output.elapsed();
+            if silence > budget {
+                log::error!(
+                    "startup watchdog fired: no daemon output for {:?} \
+                     (budget={:?}, bootstrapping={}, total_startup_time={:?})",
+                    silence,
+                    budget,
+                    bootstrapping,
+                    started.elapsed()
+                );
                 set_daemon_state(&app_state, DaemonState::Crashed);
                 refresh_status(&app);
                 return;
@@ -591,16 +648,141 @@ pub(crate) fn kill_daemon(state: &AppState) {
 /// sweep both to be sure we don't leave a half-dead process around.
 const DAEMON_LISTEN_PORTS: [&str; 2] = ["8000", "8443"];
 
-/// Daemon module entry point. Used on Windows to match the orphaned Python
-/// process by its command line, as a belt-and-braces on top of the port
-/// sweep (catches a daemon that died after forking but before binding, or
-/// one that only holds the serial port). Mirrors the desktop app's
-/// `DAEMON_PROCESS_PATTERN`.
-#[cfg(windows)]
+/// Daemon module entry point. Used to match orphaned processes by their
+/// command line: on Windows as a belt-and-braces sweep on top of the port
+/// scan, and on both platforms as the identity check before killing a
+/// port owner. Mirrors the desktop app's `DAEMON_PROCESS_PATTERN`.
+#[cfg(any(unix, windows, test))]
 const DAEMON_PROCESS_PATTERN: &str = "reachy_mini.daemon.app.main";
 
-/// Find any process currently bound to one of [`DAEMON_LISTEN_PORTS`] and
-/// kill it with SIGKILL. Called in several places:
+/// Command-line substrings that identify a process as "ours" for the
+/// purpose of the orphan sweep: the Python daemon module, or the
+/// `uv-trampoline` bootstrap sidecar that spawns it.
+#[cfg(any(unix, windows, test))]
+const DAEMON_CMDLINE_PATTERNS: [&str; 2] = [DAEMON_PROCESS_PATTERN, "uv-trampoline"];
+
+/// `true` when a process command line looks like our daemon / trampoline.
+///
+/// Fail-open on an *unreadable* command line (process already gone, or
+/// permission issue): treating it as ours preserves the historical cleanup
+/// behaviour and killing an already-dead pid is harmless. Only a readable
+/// command line that clearly belongs to something else vetoes the kill -
+/// that's the case that used to nuke a user's unrelated dev server bound
+/// to port 8000.
+#[cfg(any(unix, windows, test))]
+fn cmdline_is_ours(cmdline: Option<&str>) -> bool {
+    match cmdline {
+        Some(cmd) if !cmd.trim().is_empty() => {
+            DAEMON_CMDLINE_PATTERNS.iter().any(|p| cmd.contains(p))
+        }
+        _ => true,
+    }
+}
+
+/// Read a process's command line, or `None` when it can't be read.
+#[cfg(unix)]
+fn process_cmdline(pid: i32) -> Option<String> {
+    let out = crate::proc::hidden_command("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let cmd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
+/// Read a process's command line via PowerShell CIM (WMI). `wmic` is
+/// deprecated and already absent from fresh Windows 11 installs, so we go
+/// through `Get-CimInstance` instead.
+#[cfg(windows)]
+fn process_cmdline(pid: &str) -> Option<String> {
+    let out = crate::proc::hidden_command("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "(Get-CimInstance Win32_Process -Filter \"ProcessId={}\").CommandLine",
+                pid
+            ),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let cmd = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd)
+    }
+}
+
+/// List the pids currently LISTENING on one of [`DAEMON_LISTEN_PORTS`]
+/// that also *look like our daemon* (identity check by command line).
+///
+/// We shell out to `lsof` because it's the only universally-available way
+/// on macOS (no `/proc/net/tcp`) to map a TCP port to its owner pid without
+/// adding a 2 MB networking crate. `lsof -nP -iTCP:8000 -iTCP:8443
+/// -sTCP:LISTEN -t` prints one pid per line and exits 1 if nothing matches
+/// - both are fine.
+#[cfg(unix)]
+fn find_daemon_listener_pids() -> Vec<i32> {
+    let mut lsof_args: Vec<String> = vec!["-nP".to_string()];
+    for port in DAEMON_LISTEN_PORTS {
+        lsof_args.push(format!("-iTCP:{}", port));
+    }
+    lsof_args.push("-sTCP:LISTEN".to_string());
+    lsof_args.push("-t".to_string());
+
+    let output = match crate::proc::hidden_command("lsof")
+        .args(&lsof_args)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::debug!("lsof not available, skipping zombie sweep: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // A process listening on both ports shows up once per port, so dedup
+    // while preserving order.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut pids: Vec<i32> = Vec::new();
+    for pid in stdout.lines().filter_map(|s| s.trim().parse::<i32>().ok()) {
+        if pids.contains(&pid) {
+            continue;
+        }
+        // Identity check: only reap processes whose command line matches the
+        // daemon / trampoline. A user's unrelated dev server parked on port
+        // 8000 must NOT be collateral damage of the tray's zombie sweep.
+        let cmdline = process_cmdline(pid);
+        if !cmdline_is_ours(cmdline.as_deref()) {
+            log::warn!(
+                "process pid={} is listening on a daemon port but doesn't look like \
+                 our daemon (cmdline: {:?}); leaving it alone - the daemon start \
+                 will likely fail with 'address already in use'",
+                pid,
+                cmdline
+            );
+            continue;
+        }
+        pids.push(pid);
+    }
+    pids
+}
+
+/// Find any *daemon-looking* process bound to one of [`DAEMON_LISTEN_PORTS`]
+/// and kill it: graceful SIGTERM first, then SIGKILL for survivors (same
+/// two-phase pattern as the desktop app's `cleanup_system_daemons`). Called
+/// in several places:
 ///
 /// 1. At tray boot (from `lib.rs::setup`), to clean up orphans left over
 ///    from a previous tray that died without running its shutdown hook
@@ -618,80 +800,36 @@ const DAEMON_PROCESS_PATTERN: &str = "reachy_mini.daemon.app.main";
 /// All paths clean up the same class of zombies (the kind that surface
 /// as `[Errno 48] address already in use` on the next daemon spawn).
 ///
-/// We shell out to `lsof` because it's the only universally-available way
-/// on macOS (no `/proc/net/tcp`) to map a TCP port to its owner pid without
-/// adding a 2 MB networking crate. `lsof -nP -iTCP:8000 -iTCP:8443
-/// -sTCP:LISTEN -t` prints one pid per line and exits 1 if nothing matches
-/// - both are fine.
-///
-/// Belt-and-braces: also nukes the killed pid's process group, so if the
+/// Belt-and-braces: also signals the pid's process group, so if the
 /// zombie was itself a parent (e.g. an old trampoline), its Python child
 /// goes down too.
 #[cfg(unix)]
 pub(crate) fn reap_orphaned_daemons() {
-    let mut lsof_args: Vec<String> = vec!["-nP".to_string()];
-    for port in DAEMON_LISTEN_PORTS {
-        lsof_args.push(format!("-iTCP:{}", port));
-    }
-    lsof_args.push("-sTCP:LISTEN".to_string());
-    lsof_args.push("-t".to_string());
-
-    let output = match std::process::Command::new("lsof").args(&lsof_args).output() {
-        Ok(o) => o,
-        Err(e) => {
-            log::debug!("lsof not available, skipping zombie sweep: {}", e);
-            return;
-        }
-    };
-
-    // A process listening on both ports shows up once per port, so dedup
-    // while preserving order.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut pids: Vec<i32> = Vec::new();
-    for pid in stdout.lines().filter_map(|s| s.trim().parse::<i32>().ok()) {
-        if !pids.contains(&pid) {
-            pids.push(pid);
-        }
-    }
-
+    let pids = find_daemon_listener_pids();
     if pids.is_empty() {
         return;
     }
 
     log::warn!(
-        "found {} orphan process(es) on TCP/{:?}, killing: {:?}",
+        "found {} orphan daemon process(es) on TCP/{:?}, terminating: {:?}",
         pids.len(),
         DAEMON_LISTEN_PORTS,
         pids
     );
 
-    // Our own process group. In dev (`yarn dev`) the tray binary, the shell
-    // job and a daemon child that failed to `setpgid` into its own group can
-    // all share this single group. We must never `killpg` it, or we SIGKILL
-    // the tray (and `yarn dev`) itself - observed as exit 137 + the app
-    // closing whenever the daemon is restarted with a leftover orphan around.
-    // SAFETY: getpgrp(2) is a libc syscall.
-    let own_pgid = unsafe { libc::getpgrp() };
+    // Phase 1: graceful SIGTERM so uvicorn can unbind its sockets cleanly.
+    for pid in &pids {
+        signal_pid_and_group(*pid, libc::SIGTERM);
+    }
+    std::thread::sleep(Duration::from_millis(500));
 
-    for pid in pids {
-        // SAFETY: kill(2)/killpg(2)/getpgid(2) are libc syscalls.
-        unsafe {
-            // First the whole group (catches forked workers) - but only if
-            // it isn't our own group, otherwise we'd take the tray down too.
-            let pgid = libc::getpgid(pid);
-            if pgid > 1 && pgid != own_pgid {
-                libc::killpg(pgid, libc::SIGKILL);
-            } else if pgid == own_pgid {
-                log::warn!(
-                    "orphan pid={} shares the tray's process group ({}); \
-                     killing the pid directly instead of the group",
-                    pid,
-                    pgid
-                );
-            }
-            // Then the pid itself: always safe (it's the orphan, never us),
-            // and the only thing we can do when the orphan shares our group.
-            libc::kill(pid, libc::SIGKILL);
+    // Phase 2: SIGKILL whatever survived (re-scan instead of reusing the
+    // old list: most orphans exit within the grace window).
+    let survivors = find_daemon_listener_pids();
+    if !survivors.is_empty() {
+        log::warn!("orphans survived SIGTERM, force-killing: {:?}", survivors);
+        for pid in &survivors {
+            signal_pid_and_group(*pid, libc::SIGKILL);
         }
     }
 
@@ -701,86 +839,150 @@ pub(crate) fn reap_orphaned_daemons() {
     std::thread::sleep(Duration::from_millis(200));
 }
 
-/// Windows counterpart to the Unix zombie sweep above. Same purpose (kill any
-/// orphaned daemon holding `:8000` / `:8443` / the serial port so the next
-/// `Start` doesn't fail with `address already in use`), but Windows has no
-/// process groups or POSIX signals, so we shell out to built-in tools:
+/// Send `sig` to `pid` and (when safe) to its whole process group.
 ///
-/// 1. `netstat -ano` maps each daemon listening port to its owning PID;
-/// 2. `taskkill /F /T /PID <pid>` force-kills that PID **and its whole child
-///    tree** (`/T`), so killing either the trampoline or the Python child
-///    takes the other down too;
-/// 3. belt-and-braces: `wmic` finds any Python process whose command line
-///    still mentions the daemon module and `taskkill`s it, catching a daemon
-///    that hadn't bound a port yet.
-///
-/// All three tools ship with Windows, so this adds no dependency and needs no
-/// `libc`. Mirrors `cleanup_system_daemons()` in the desktop app.
-#[cfg(windows)]
-pub(crate) fn reap_orphaned_daemons() {
-    use std::process::Command;
-
-    let own_pid = std::process::id().to_string();
-
-    // ---- 1 + 2: sweep by listening port ----
-    let mut pids: Vec<String> = Vec::new();
-    match Command::new("netstat").arg("-ano").output() {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            for line in stdout.lines() {
-                if !line.contains("LISTENING") {
-                    continue;
-                }
-                let on_daemon_port = DAEMON_LISTEN_PORTS
-                    .iter()
-                    .any(|p| line.contains(&format!(":{}", p)));
-                if !on_daemon_port {
-                    continue;
-                }
-                // The PID is the last whitespace-separated column.
-                if let Some(pid) = line.split_whitespace().last() {
-                    if pid != "0" && pid != own_pid && !pids.iter().any(|p| p == pid) {
-                        pids.push(pid.to_string());
-                    }
-                }
-            }
+/// Never signals our own process group: in dev (`yarn dev`) the tray
+/// binary, the shell job and a daemon child that failed to `setpgid` into
+/// its own group can all share one group, and a group kill would take the
+/// tray (and `yarn dev`) down too - observed as exit 137 whenever the
+/// daemon was restarted with a leftover orphan around.
+#[cfg(unix)]
+fn signal_pid_and_group(pid: i32, sig: i32) {
+    // SAFETY: kill(2)/killpg(2)/getpgid(2)/getpgrp(2) are libc syscalls.
+    unsafe {
+        let own_pgid = libc::getpgrp();
+        let pgid = libc::getpgid(pid);
+        if pgid > 1 && pgid != own_pgid {
+            libc::killpg(pgid, sig);
+        } else if pgid == own_pgid {
+            log::warn!(
+                "orphan pid={} shares the tray's process group ({}); \
+                 signalling the pid directly instead of the group",
+                pid,
+                pgid
+            );
         }
+        // Then the pid itself: always safe (it's the orphan, never us),
+        // and the only thing we can do when the orphan shares our group.
+        libc::kill(pid, sig);
+    }
+}
+
+/// List the PIDs LISTENING on one of [`DAEMON_LISTEN_PORTS`] that also look
+/// like our daemon (identity check by command line, same rationale as the
+/// Unix path: never taskkill a user's unrelated server parked on 8000).
+#[cfg(windows)]
+fn find_daemon_listener_pids() -> Vec<String> {
+    let own_pid = std::process::id().to_string();
+    let mut pids: Vec<String> = Vec::new();
+
+    let out = match crate::proc::hidden_command("netstat").arg("-ano").output() {
+        Ok(o) => o,
         Err(e) => {
             log::debug!(
                 "netstat not available, skipping port-based zombie sweep: {}",
                 e
             );
+            return pids;
         }
-    }
+    };
 
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if !line.contains("LISTENING") {
+            continue;
+        }
+        let on_daemon_port = DAEMON_LISTEN_PORTS
+            .iter()
+            .any(|p| line.contains(&format!(":{}", p)));
+        if !on_daemon_port {
+            continue;
+        }
+        // The PID is the last whitespace-separated column.
+        let Some(pid) = line.split_whitespace().last() else {
+            continue;
+        };
+        if pid == "0" || pid == own_pid || pids.iter().any(|p| p == pid) {
+            continue;
+        }
+        let cmdline = process_cmdline(pid);
+        if !cmdline_is_ours(cmdline.as_deref()) {
+            log::warn!(
+                "process pid={} is listening on a daemon port but doesn't look like \
+                 our daemon (cmdline: {:?}); leaving it alone",
+                pid,
+                cmdline
+            );
+            continue;
+        }
+        pids.push(pid.to_string());
+    }
+    pids
+}
+
+/// Windows counterpart to the Unix zombie sweep above. Same purpose (kill any
+/// orphaned daemon holding `:8000` / `:8443` / the serial port so the next
+/// `Start` doesn't fail with `address already in use`), but Windows has no
+/// process groups or POSIX signals, so we shell out to built-in tools:
+///
+/// 1. `netstat -ano` maps each daemon listening port to its owning PID
+///    (identity-checked via its command line);
+/// 2. `taskkill /T /PID <pid>` asks that PID **and its whole child tree**
+///    (`/T`) to close, then `/F` force-kills survivors after a grace window
+///    (same two-phase pattern as the desktop app);
+/// 3. belt-and-braces: PowerShell CIM finds any process whose command line
+///    still mentions the daemon module and `taskkill`s it, catching a daemon
+///    that hadn't bound a port yet. (`Get-CimInstance` rather than `wmic`,
+///    which is deprecated and absent from recent Windows 11 builds.)
+///
+/// All tools ship with Windows, so this adds no dependency and needs no
+/// `libc`. Mirrors `cleanup_system_daemons()` in the desktop app.
+#[cfg(windows)]
+pub(crate) fn reap_orphaned_daemons() {
+    let own_pid = std::process::id().to_string();
+
+    // ---- 1 + 2: sweep by listening port, graceful then forced ----
+    let pids = find_daemon_listener_pids();
     if !pids.is_empty() {
         log::warn!(
-            "found {} orphan process(es) on TCP/{:?}, killing: {:?}",
+            "found {} orphan daemon process(es) on TCP/{:?}, terminating: {:?}",
             pids.len(),
             DAEMON_LISTEN_PORTS,
             pids
         );
         for pid in &pids {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", pid.as_str()])
+            let _ = crate::proc::hidden_command("taskkill")
+                .args(["/T", "/PID", pid.as_str()])
                 .output();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+
+        let survivors = find_daemon_listener_pids();
+        if !survivors.is_empty() {
+            log::warn!(
+                "orphans survived graceful taskkill, force-killing: {:?}",
+                survivors
+            );
+            for pid in &survivors {
+                let _ = crate::proc::hidden_command("taskkill")
+                    .args(["/F", "/T", "/PID", pid.as_str()])
+                    .output();
+            }
         }
     }
 
     // ---- 3: belt-and-braces sweep by command line ----
-    if let Ok(out) = Command::new("wmic")
-        .args([
-            "process",
-            "where",
-            &format!("CommandLine like '%{}%'", DAEMON_PROCESS_PATTERN),
-            "get",
-            "ProcessId",
-        ])
+    let ps_script = format!(
+        "Get-CimInstance Win32_Process -Filter \"CommandLine like '%{}%'\" | \
+         ForEach-Object {{ $_.ProcessId }}",
+        DAEMON_PROCESS_PATTERN
+    );
+    if let Ok(out) = crate::proc::hidden_command("powershell")
+        .args(["-NoProfile", "-Command", &ps_script])
         .output()
     {
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // Skip the `ProcessId` header line.
-        for line in stdout.lines().skip(1) {
+        for line in stdout.lines() {
             let pid = line.trim();
             if !pid.is_empty()
                 && pid != own_pid
@@ -788,7 +990,7 @@ pub(crate) fn reap_orphaned_daemons() {
                 && !pids.iter().any(|p| p == pid)
             {
                 log::warn!("killing orphan Python daemon by module name (pid={})", pid);
-                let _ = Command::new("taskkill")
+                let _ = crate::proc::hidden_command("taskkill")
                     .args(["/F", "/T", "/PID", pid])
                     .output();
             }
@@ -866,6 +1068,16 @@ fn has_connectivity() -> bool {
         .any(|url| client.head(*url).send().is_ok())
 }
 
+/// Fire-and-forget native OS notification. The tray has no main window, so
+/// this is the only way to surface an unexpected decision (e.g. the silent
+/// USB -> Simulation downgrade) to a user who isn't staring at the menu.
+fn notify(app: &AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        log::warn!("failed to show notification '{}': {}", title, e);
+    }
+}
+
 pub(crate) fn start_daemon(app: &AppHandle) {
     let app_state = app.state::<AppState>();
     if matches!(
@@ -904,6 +1116,17 @@ pub(crate) fn start_daemon(app: &AppHandle) {
             // we don't want a future hot-plug to silently re-engage
             // USB on the next start without an explicit user pick.
             set_serialport(&app_state, None);
+            // Surface the downgrade to the user: without this the tray
+            // silently starts a simulated robot while they think their
+            // physical Reachy is live (edge case "silent USB -> Sim
+            // fallback"). Best-effort - notification permission may be
+            // denied, the log above remains the source of truth.
+            notify(
+                app,
+                "No robot detected on USB",
+                "Starting in Simulation mode instead. Plug the robot in and pick it \
+                 from the Robot menu to use USB.",
+            );
         }
     }
 
@@ -950,6 +1173,9 @@ pub(crate) fn start_daemon(app: &AppHandle) {
 
     set_daemon_state(&app_state, DaemonState::Starting);
     let gen = next_generation(&app_state);
+    // Fresh watchdog deadline for this spawn: last_output = now, no
+    // bootstrap flag carried over from a previous run.
+    crate::state::reset_startup_activity(&app_state);
     refresh_status(app);
 
     match spawn_real_daemon(app, mode, serialport.as_deref(), gen) {
@@ -975,9 +1201,9 @@ pub(crate) fn start_daemon(app: &AppHandle) {
     }
 
     // Real readiness probe: poll `GET /daemon/status` every
-    // HEALTHCHECK_INTERVAL until 200 OK, max HEALTHCHECK_MAX_DURATION.
-    // Generation guard inside the thread filters out stale signals after
-    // Stop / Restart sequences.
+    // HEALTHCHECK_INTERVAL until 200 OK, watchdogged by the activity-based
+    // inactivity budget. Generation guard inside the thread filters out
+    // stale signals after Stop / Restart sequences.
     start_healthcheck(app.clone(), gen);
 }
 
@@ -1089,5 +1315,74 @@ mod tests {
         // log-format change that could put them on the same line).
         let p = derive_bootstrap_event("Setup complete! Starting Reachy Mini daemon now");
         assert_eq!(p.percent, Some(98));
+    }
+
+    // ---- startup watchdog: bootstrap flag ----
+
+    #[test]
+    fn bootstrap_flag_turns_on_with_bootstrap_lines() {
+        assert_eq!(
+            derive_bootstrap_flag("[bootstrap] First run detected"),
+            Some(true)
+        );
+        assert_eq!(
+            derive_bootstrap_flag("[bootstrap] Installing Python 3.12..."),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn bootstrap_flag_turns_off_on_setup_complete() {
+        assert_eq!(
+            derive_bootstrap_flag("[bootstrap] Setup complete!"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn bootstrap_flag_untouched_by_other_lines() {
+        // Prewarm lines and heartbeats arrive mid-bootstrap WITHOUT the
+        // `[bootstrap]` prefix; they must not clear the flag (they'd shrink
+        // the watchdog budget back to 90 s in the middle of the GStreamer
+        // scan).
+        assert_eq!(
+            derive_bootstrap_flag("[prewarm:.venv] scanning plugin registry"),
+            None
+        );
+        assert_eq!(
+            derive_bootstrap_flag("uvicorn started server process"),
+            None
+        );
+    }
+
+    // ---- orphan sweep: identity check ----
+
+    #[test]
+    fn cmdline_matching_daemon_module_is_ours() {
+        assert!(cmdline_is_ours(Some(
+            "/path/.venv/bin/python3 -m reachy_mini.daemon.app.main --desktop-app-daemon"
+        )));
+    }
+
+    #[test]
+    fn cmdline_matching_trampoline_is_ours() {
+        assert!(cmdline_is_ours(Some(
+            "/Applications/Reachy.app/Contents/MacOS/uv-trampoline .venv/bin/python3"
+        )));
+    }
+
+    #[test]
+    fn unrelated_cmdline_is_not_ours() {
+        assert!(!cmdline_is_ours(Some("node /Users/dev/my-app/server.js")));
+        assert!(!cmdline_is_ours(Some("python3 -m http.server 8000")));
+    }
+
+    #[test]
+    fn unreadable_cmdline_fails_open() {
+        // Process already gone or permission denied: keep the historical
+        // cleanup behaviour (kill), since killing a dead pid is harmless.
+        assert!(cmdline_is_ours(None));
+        assert!(cmdline_is_ours(Some("")));
+        assert!(cmdline_is_ours(Some("   ")));
     }
 }

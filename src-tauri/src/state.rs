@@ -22,6 +22,7 @@
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tauri::image::Image;
 use tauri_plugin_shell::process::CommandChild;
@@ -84,6 +85,20 @@ pub struct AppState {
     /// discard late healthcheck / monitor callbacks from a previous run
     /// (e.g. user clicked Stop while bootstrap was still in progress).
     pub generation: Mutex<u64>,
+    /// Startup liveness tracking for the healthcheck watchdog. Mirrors the
+    /// desktop app's activity-based startup timeout: the deadline is measured
+    /// from the *last daemon output line*, not from spawn time, and the
+    /// budget is extended while a first-run bootstrap is streaming.
+    pub startup_activity: Mutex<StartupActivity>,
+}
+
+/// Snapshot of daemon output liveness while `Starting`.
+pub struct StartupActivity {
+    /// Instant of the last stdout/stderr line from the trampoline/daemon
+    /// (initialised to spawn time so a fully silent process still times out).
+    pub last_output: Instant,
+    /// `true` between the first `[bootstrap]` line and `Setup complete`.
+    pub bootstrapping: bool,
 }
 
 impl AppState {
@@ -95,6 +110,10 @@ impl AppState {
             usb_devices: Mutex::new(Vec::new()),
             state: Mutex::new(DaemonState::Idle),
             generation: Mutex::new(0),
+            startup_activity: Mutex::new(StartupActivity {
+                last_output: Instant::now(),
+                bootstrapping: false,
+            }),
         }
     }
 }
@@ -165,6 +184,37 @@ pub(crate) fn set_daemon_state(state: &AppState, new_state: DaemonState) {
     if let Ok(mut g) = state.state.lock() {
         *g = new_state;
     }
+}
+
+/// Record fresh daemon output (any stdout/stderr line). Called on the
+/// monitor thread; the healthcheck thread reads it via `startup_snapshot`.
+pub(crate) fn note_daemon_output(state: &AppState) {
+    if let Ok(mut g) = state.startup_activity.lock() {
+        g.last_output = Instant::now();
+    }
+}
+
+pub(crate) fn set_bootstrapping(state: &AppState, bootstrapping: bool) {
+    if let Ok(mut g) = state.startup_activity.lock() {
+        g.bootstrapping = bootstrapping;
+    }
+}
+
+/// Reset activity tracking at spawn time (fresh deadline, no bootstrap).
+pub(crate) fn reset_startup_activity(state: &AppState) {
+    if let Ok(mut g) = state.startup_activity.lock() {
+        g.last_output = Instant::now();
+        g.bootstrapping = false;
+    }
+}
+
+/// `(last_output, bootstrapping)` snapshot for the healthcheck watchdog.
+pub(crate) fn startup_snapshot(state: &AppState) -> (Instant, bool) {
+    state
+        .startup_activity
+        .lock()
+        .map(|g| (g.last_output, g.bootstrapping))
+        .unwrap_or((Instant::now(), false))
 }
 
 pub(crate) fn next_generation(state: &AppState) -> u64 {

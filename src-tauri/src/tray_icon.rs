@@ -19,10 +19,10 @@ fn compose_with_dot(base_rgba: &[u8], width: u32, height: u32, color: [u8; 3]) -
     let mut pixels = base_rgba.to_vec();
     let w = width as f32;
     let h = height as f32;
-    // ~26 % diameter: small enough to read as a badge but visible at the
-    // 16 px effective menu-bar size on retina. Inspired by Slack / Linear /
-    // Things status badges.
-    let radius = w.min(h) * 0.13;
+    // ~36 % diameter: a chunky, clearly-readable status badge at the 16 px
+    // effective menu-bar size on retina. Inspired by Slack / Linear / Things
+    // status badges, sized up for legibility.
+    let radius = w.min(h) * 0.18;
     // 1 px ring of transparency around the disc to detach it cleanly.
     let ring = (w.min(h) * 0.025).max(1.0);
     let pad = w.min(h) * 0.05 + ring;

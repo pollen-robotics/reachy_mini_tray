@@ -19,14 +19,60 @@ pub(crate) const FIRST_RUN_WINDOW_LABEL: &str = "first-run";
 pub(crate) const LOGS_WINDOW_LABEL: &str = "logs";
 pub(crate) const UPDATE_WINDOW_LABEL: &str = "update";
 
+/// macOS: bring the app + `window` to the foreground when opening a real,
+/// user-facing window (logs / first-run).
+///
+/// The tray runs as an `Accessory` agent (no Dock icon, never the active
+/// app), so a freshly shown window silently opens *behind* whatever app is
+/// focused - the user never sees it. Promoting to `Regular` lets the app
+/// take focus like any normal app (a Dock icon appears while a window is
+/// open, which is exactly what users expect); we drop back to `Accessory`
+/// once the last such window closes via [`demote_if_no_user_windows`].
+#[cfg(target_os = "macos")]
+fn present_window(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
+/// macOS: revert to menu-bar-agent mode (no Dock icon) once no user-facing
+/// window remains open. The update overlay is intentionally excluded: it is
+/// `always_on_top` and shows fine under `Accessory`, so it must not keep the
+/// Dock icon alive.
+#[cfg(target_os = "macos")]
+fn demote_if_no_user_windows(app: &AppHandle) {
+    let has_user_window = app.get_webview_window(LOGS_WINDOW_LABEL).is_some()
+        || app.get_webview_window(FIRST_RUN_WINDOW_LABEL).is_some();
+    if !has_user_window {
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    }
+}
+
+/// macOS: wire a `Destroyed` handler that demotes the app back to
+/// `Accessory` when this window closes. No-op on other platforms.
+#[cfg(target_os = "macos")]
+fn wire_demote_on_close(app: &AppHandle, window: &tauri::WebviewWindow) {
+    let app = app.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            demote_if_no_user_windows(&app);
+        }
+    });
+}
+
 pub(crate) fn show_first_run_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(existing) = app.get_webview_window(FIRST_RUN_WINDOW_LABEL) {
-        existing.show()?;
-        existing.set_focus()?;
+        #[cfg(target_os = "macos")]
+        present_window(app, &existing);
+        #[cfg(not(target_os = "macos"))]
+        {
+            existing.show()?;
+            existing.set_focus()?;
+        }
         return Ok(());
     }
 
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         app,
         FIRST_RUN_WINDOW_LABEL,
         WebviewUrl::App("index.html".into()),
@@ -38,13 +84,24 @@ pub(crate) fn show_first_run_window(app: &AppHandle) -> tauri::Result<()> {
     .center()
     .visible(true)
     .build()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        present_window(app, &window);
+        wire_demote_on_close(app, &window);
+    }
     Ok(())
 }
 
 pub(crate) fn show_logs_window(app: &AppHandle) -> tauri::Result<()> {
     if let Some(existing) = app.get_webview_window(LOGS_WINDOW_LABEL) {
-        existing.show()?;
-        existing.set_focus()?;
+        #[cfg(target_os = "macos")]
+        present_window(app, &existing);
+        #[cfg(not(target_os = "macos"))]
+        {
+            existing.show()?;
+            existing.set_focus()?;
+        }
         return Ok(());
     }
 
@@ -66,7 +123,13 @@ pub(crate) fn show_logs_window(app: &AppHandle) -> tauri::Result<()> {
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true);
 
-    builder.build()?;
+    let window = builder.build()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        present_window(app, &window);
+        wire_demote_on_close(app, &window);
+    }
     Ok(())
 }
 
@@ -78,23 +141,27 @@ pub(crate) fn show_logs_window(app: &AppHandle) -> tauri::Result<()> {
 /// main thread (Tauri requires webview windows to be built there on some
 /// platforms).
 pub(crate) fn show_update_window(app: &AppHandle) -> tauri::Result<()> {
-    if let Some(existing) = app.get_webview_window(UPDATE_WINDOW_LABEL) {
-        existing.show()?;
-        existing.set_focus()?;
-        return Ok(());
-    }
-
     let app = app.clone();
-    let app_build = app.clone();
-    app.run_on_main_thread(move || {
-        // Re-check after hopping threads: a concurrent check could have
-        // created the window in the meantime.
-        if app_build.get_webview_window(UPDATE_WINDOW_LABEL).is_some() {
+    // Everything - the existence check, the show/focus of an already-open
+    // overlay, and the build of a new one - runs inside this single
+    // main-thread closure. This is deliberate:
+    //   1. `show_update_window` is called from the updater's async check
+    //      task, and AppKit window ops (`show`/`set_focus`/`build`) must run
+    //      on the main thread on macOS.
+    //   2. Doing the `get_webview_window` check *inside* the closure (rather
+    //      than at call time) serialises concurrent callers - a startup
+    //      check and a manual "Check for updates" firing together can't race
+    //      into building two overlays, because the second closure sees the
+    //      window the first one created.
+    app.clone().run_on_main_thread(move || {
+        if let Some(existing) = app.get_webview_window(UPDATE_WINDOW_LABEL) {
+            let _ = existing.show();
+            let _ = existing.set_focus();
             return;
         }
 
         let builder = WebviewWindowBuilder::new(
-            &app_build,
+            &app,
             UPDATE_WINDOW_LABEL,
             WebviewUrl::App("update.html".into()),
         )

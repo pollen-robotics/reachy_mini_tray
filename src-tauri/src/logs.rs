@@ -74,8 +74,15 @@ static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 struct AppLogger;
 
 impl Log for AppLogger {
+    /// Info+ from everyone, plus Debug from our own crate. Without the
+    /// second arm every `log::debug!` in the tray was silently dropped
+    /// (max level used to be Info) while the logs window still offered a
+    /// DEBUG filter pill - a debugging trap. Foreign crates stay capped at
+    /// Info so reqwest/tauri internals can't flood the buffer.
     fn enabled(&self, metadata: &Metadata) -> bool {
         metadata.level() <= Level::Info
+            || (metadata.level() == Level::Debug
+                && metadata.target().starts_with("reachy_mini_tray"))
     }
 
     fn log(&self, record: &Record) {
@@ -124,7 +131,9 @@ impl Log for AppLogger {
 pub fn init() {
     static LOGGER: AppLogger = AppLogger;
     let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Info);
+    // Debug so our own `log::debug!` records reach `enabled()` at all;
+    // the per-record filter above still drops foreign-crate debug spam.
+    log::set_max_level(log::LevelFilter::Debug);
 }
 
 /// Once the Tauri app is built, register its handle so subsequent log

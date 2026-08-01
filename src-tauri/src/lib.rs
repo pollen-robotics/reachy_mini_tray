@@ -28,6 +28,7 @@
 //! - [`api`]: daemon base URL + shared `reqwest` client factory.
 //! - [`logs`]: in-memory ring-buffer logger.
 //! - [`paths`]: data-dir layout (shared with `reachy_mini_desktop_app`).
+//! - [`settings`]: tiny persisted tray settings (connection mode).
 //! - [`usb`]: enumerate / filter Reachy Mini USB-serial devices.
 //!
 //! Explicitly out of scope: autostart-at-login, system sleep/wake
@@ -44,6 +45,8 @@ mod hf_auth;
 mod logs;
 mod menu_icons;
 mod paths;
+mod proc;
+mod settings;
 mod state;
 mod tray_icon;
 mod tray_menu;
@@ -55,7 +58,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, RunEvent};
 
 use crate::commands::{show_first_run_window, show_logs_window};
-use crate::daemon::{kill_daemon, start_daemon, stop_daemon};
+use crate::daemon::{kill_daemon, stop_daemon};
 use crate::logs::LogStore;
 use crate::state::{
     current_daemon_state, current_mode, current_usb_devices, set_daemon_state, set_serialport,
@@ -65,7 +68,7 @@ use crate::tray_icon::build_icon_cache;
 use crate::tray_menu::{
     build_tray_menu, refresh_status, ID_ACCOUNT_REFRESH_RELAY, ID_ACCOUNT_SIGNIN,
     ID_ACCOUNT_SIGNOUT, ID_ACCOUNT_SUBMENU, ID_QUIT, ID_RESET_SETUP, ID_SHOW_LOGS, ID_TARGET_SIM,
-    ID_TARGET_USB_PREFIX, ID_TOGGLE, ID_UPDATE_APP, ID_UPDATE_DAEMON, TRAY_ID,
+    ID_TARGET_USB_PREFIX, ID_TOGGLE, ID_UPDATE_DAEMON, TRAY_ID,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -93,6 +96,9 @@ pub fn run() {
         // plugin wires the Rust `app.updater()` API against the endpoint +
         // pubkey configured in `tauri.conf.json`.
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Native OS notifications, used to surface tray-initiated decisions
+        // that would otherwise be invisible (e.g. USB -> Simulation fallback).
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())
         .manage(LogStore::new())
         .manage(hf_auth::AuthStatusStore::new())
@@ -151,18 +157,34 @@ pub fn run() {
             // applies (port + module-name based instead of process-group).
             daemon::reap_orphaned_daemons();
 
+            // ---- Restore persisted connection mode ----
+            //
+            // The user's last explicit USB / Simulation pick survives tray
+            // restarts (a user who always runs in sim shouldn't have to
+            // re-pick it at every login). The boot-time USB reconciliation
+            // further down still applies: a persisted USB mode with no
+            // robot plugged in downgrades to Simulation as before.
+            if let Some(saved_mode) = settings::load_mode() {
+                let app_state = app.state::<AppState>();
+                if let Ok(mut guard) = app_state.mode.lock() {
+                    *guard = saved_mode;
+                }
+                log::info!("restored persisted mode: {}", saved_mode.as_str());
+            }
+
             // ---- Initial tray menu ----
             //
             // The full menu is rebuilt on every `refresh_status` call, so
-            // this is just the boot-time snapshot (Idle daemon + USB +
-            // empty auth). Topology and labels will adjust as soon as
-            // state changes.
+            // this is just the boot-time snapshot (Idle daemon + restored
+            // mode + empty auth). Topology and labels will adjust as soon
+            // as state changes.
+            let boot_mode = current_mode(&app.state::<AppState>());
             let initial_snap = hf_auth::AuthSnapshot::default();
             let initial_update = daemon_update::UpdateSnapshot::default();
             let menu = build_tray_menu(
                 &app.handle().clone(),
                 DaemonState::Idle,
-                Mode::Usb,
+                boot_mode,
                 None,
                 &[],
                 &initial_snap,
@@ -216,7 +238,12 @@ pub fn run() {
                             }
                             let app_state = app.state::<AppState>();
                             match current_daemon_state(&app_state) {
-                                DaemonState::Idle | DaemonState::Crashed => start_daemon(app),
+                                // Every launch goes through the forced-update
+                                // gate: if a newer daemon release is known, the
+                                // venv is upgraded first, then the daemon boots.
+                                DaemonState::Idle | DaemonState::Crashed => {
+                                    daemon_update::update_then_start(app)
+                                }
                                 DaemonState::Running => stop_daemon(app),
                                 // Disabled while Starting; defensive no-op.
                                 DaemonState::Starting => {}
@@ -242,6 +269,7 @@ pub fn run() {
                             // a future menu refresh could mis-render the
                             // selected device.
                             set_serialport(&app_state, None);
+                            settings::save_mode(Mode::Simulation);
                             log::info!("target set to Simulation");
                             refresh_status(app);
                         }
@@ -273,6 +301,7 @@ pub fn run() {
                                 *guard = Mode::Usb;
                             }
                             set_serialport(&app_state, Some(dev.serialport.clone()));
+                            settings::save_mode(Mode::Usb);
                             log::info!("target set to USB ({})", dev.serialport);
                             refresh_status(app);
                         }
@@ -295,12 +324,6 @@ pub fn run() {
                             if let Err(e) = show_logs_window(app) {
                                 log::warn!("failed to show logs window: {}", e);
                             }
-                        }
-                        ID_UPDATE_APP => {
-                            // Manual self-update check: opens the overlay if a
-                            // newer tray release is available, otherwise logs
-                            // "already latest".
-                            app_update::check_now(app);
                         }
                         ID_RESET_SETUP => {
                             // Wiping the venv mid-upgrade would race the in-flight
@@ -326,8 +349,10 @@ pub fn run() {
                             // first-launch path. Without this the venv stays
                             // empty and the first-run window sits at 0% forever
                             // until the user manually clicks Start daemon -
-                            // surprising UX for a "Reset" action.
-                            start_daemon(app);
+                            // surprising UX for a "Reset" action. Routed through
+                            // the update gate for uniformity; with the venv just
+                            // wiped it degenerates to a plain start.
+                            daemon_update::update_then_start(app);
                         }
                         ID_QUIT => {
                             log::info!("quit requested");
@@ -364,8 +389,7 @@ pub fn run() {
             // newer tray bundle is published, opens the blocking update
             // overlay. Gated to release builds: a `cargo run` / `tauri dev`
             // binary can't be replaced in place by the updater, so checking
-            // in dev would only ever surface a non-installable prompt. Use
-            // the "Check for Updates…" menu item for on-demand checks.
+            // in dev would only ever surface a non-installable prompt.
             #[cfg(not(debug_assertions))]
             app_update::start_update_check(app_handle.clone());
 
@@ -383,8 +407,8 @@ pub fn run() {
             );
             // Boot-time mode reconciliation.
             //
-            // The mode in `AppState` defaults to `Mode::Usb` (and a
-            // future revision could persist the user's last choice).
+            // The mode in `AppState` defaults to `Mode::Usb`, possibly
+            // overridden above by the persisted user choice.
             // If we land at boot with no Reachy plugged in but the
             // mode says USB, we MUST downgrade to Simulation - else
             // an auto-start (first-launch path below, or `start_daemon`
@@ -456,8 +480,10 @@ pub fn run() {
                 show_first_run_window(&app_handle)?;
                 // Kick off the bootstrap immediately. Default mode is USB;
                 // the user can switch to Simulation later from the tray
-                // menu (which will trigger a restart of the daemon).
-                start_daemon(&app_handle);
+                // menu (which will trigger a restart of the daemon). Routed
+                // through the update gate for uniformity; with no venv yet
+                // it degenerates to a plain start.
+                daemon_update::update_then_start(&app_handle);
             }
 
             Ok(())
