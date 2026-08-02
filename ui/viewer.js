@@ -106,8 +106,6 @@ const CAMERA = {
   fov: 50,
   near: 0.01,
   far: 50,
-  minDistance: 0.12,
-  maxDistance: 2.0,
 };
 
 // Match the mobile viewer's lighting.
@@ -381,13 +379,15 @@ class Reachy3DViewer {
 
     this._buildGrid(palette);
 
+    // Orbit only: the preset framing is the right size for the pane, so pan
+    // and zoom are disabled - the user can spin around the robot but can't
+    // lose it off-screen or dolly into the fog.
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enablePan = false;
+    this.controls.enableZoom = false;
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.05;
     this.controls.target.set(...CAMERA.target);
-    this.controls.minDistance = CAMERA.minDistance;
-    this.controls.maxDistance = CAMERA.maxDistance;
     this.controls.update();
 
     this.resizeObserver = new ResizeObserver(() => this._handleResize());
