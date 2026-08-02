@@ -18,8 +18,10 @@
         --error: #ff6b6b;
         --debug: #7a808d;
         --trace: #5a606d;
-        /* The 3D viz always renders on white (see COLORS_LIGHT in viewer.js). */
-        --viz-bg: #ffffff;
+        /* Must stay in sync with the scene clear colors in viewer.js
+           (COLORS_DARK.bg / COLORS_LIGHT.bg) so the pane blends seamlessly
+           with the 3D canvas in both schemes. */
+        --viz-bg: #0e0f12;
       }
       @media (prefers-color-scheme: light) {
         :root {

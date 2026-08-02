@@ -119,14 +119,26 @@ const LIGHTING = {
   rimColor: 0xffb366,
 };
 
-// The 3D viewer always renders on a white background, independent of the OS
-// colour scheme, so the robot reads consistently.
+// Scene palette per OS colour scheme. The dark values match the logs
+// window's `--viz-bg` (see logs.html) so the canvas blends into the pane,
+// same approach as the mobile viz (which renders on the app's dark surface
+// with a neutral grid + re-tinted antennas).
 const COLORS_LIGHT = {
   bg: 0xffffff,
   fog: 0xffffff,
   gridMajor: 0x999999,
   gridMinor: 0xcccccc,
 };
+const COLORS_DARK = {
+  bg: 0x0e0f12,
+  fog: 0x0e0f12,
+  gridMajor: 0x565b66,
+  gridMinor: 0x2e323a,
+};
+
+function currentPalette(dark) {
+  return dark ? COLORS_DARK : COLORS_LIGHT;
+}
 
 // Extra beat after the first valid pose before revealing the viz, so the
 // smoothing has settled and we never show the robot mid-snap.
@@ -321,7 +333,8 @@ class Reachy3DViewer {
     this.onStatusChange = onStatusChange ?? null;
     this.onStats = onStats ?? null;
 
-    const palette = COLORS_LIGHT;
+    this.themeMql = window.matchMedia("(prefers-color-scheme: dark)");
+    const palette = currentPalette(this.themeMql.matches);
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(palette.bg);
@@ -380,8 +393,10 @@ class Reachy3DViewer {
     this.resizeObserver = new ResizeObserver(() => this._handleResize());
     this.resizeObserver.observe(mountEl);
 
-    this.themeMql = window.matchMedia("(prefers-color-scheme: dark)");
-    this.themeListener = () => this._applyPalette(COLORS_LIGHT);
+    // Live theme switching: re-palette the scene when the OS scheme flips
+    // while the logs window is open (the CSS side follows automatically via
+    // the media query in logs.html).
+    this.themeListener = (evt) => this._applyPalette(currentPalette(evt.matches));
     this.themeMql.addEventListener("change", this.themeListener);
 
     this._lastTickAt = performance.now();
@@ -437,7 +452,7 @@ class Reachy3DViewer {
     this.scene.background = new THREE.Color(palette.bg);
     this.fog.color = new THREE.Color(palette.fog);
     this._buildGrid(palette);
-    this._applyAntennaTint(false);
+    this._applyAntennaTint(palette === COLORS_DARK);
   }
 
   /**
@@ -500,7 +515,7 @@ class Reachy3DViewer {
     this.scene.updateMatrixWorld(true);
     this._setupModel(model);
 
-    this._applyAntennaTint(false);
+    this._applyAntennaTint(this.themeMql?.matches ?? false);
 
     // Reveal the (rest-pose) model even if no live pose ever arrives, e.g. the
     // daemon is offline. A valid head pose reveals sooner via `_onFirstPose`.
