@@ -101,8 +101,10 @@ const BONE = {
 // Camera preset. Pulled back a bit from the mobile framing (which sits ~20%
 // closer) so the robot doesn't fill the whole canvas in the tray's logs pane.
 const CAMERA = {
-  position: [-0.29, 0.44, 0.64],
-  target: [0, 0.2, 0],
+  position: [-0.29, 0.46, 0.64],
+  // Target slightly above the head so the robot sits a touch lower in the
+  // frame (raising the look-at point pushes the model down on screen).
+  target: [0, 0.24, 0],
   fov: 50,
   near: 0.01,
   far: 50,
